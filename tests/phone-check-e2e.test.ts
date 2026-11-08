@@ -51,14 +51,15 @@ function fakeGoogle(items: Map<string, GoogleItem>): PhoneCheckApi {
 
 describe.skipIf(!PYTHON)('phone script and GPTK Phone Check together', () => {
   let storage: string;
-  let files: Record<'backedUp' | 'backedUpCopy' | 'trashed' | 'partial' | 'storageSaver' | 'phoneOnly', string>;
+  let files: Record<'backedUp' | 'backedUpCopy' | 'backedUpCamera' | 'trashed' | 'partial' | 'storageSaver' | 'phoneOnly', string>;
 
-  const put = (relativePath: string, content: string): string => {
-    const path = join(storage, 'Android/media/com.whatsapp/WhatsApp/Media', relativePath);
+  const write = (path: string, content: string): string => {
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, content);
     return path;
   };
+  const put = (relativePath: string, content: string): string => write(join(storage, 'Android/media/com.whatsapp/WhatsApp/Media', relativePath), content);
+  const putOutsideWhatsApp = (relativePath: string, content: string): string => write(join(storage, relativePath), content);
   const runScript = (args: string[], answer = ''): number | null =>
     spawnSync(PYTHON ?? 'python3', [SCRIPT, ...args, '--storage', storage], { input: answer, encoding: 'utf8' }).status;
 
@@ -82,6 +83,7 @@ describe.skipIf(!PYTHON)('phone script and GPTK Phone Check together', () => {
     files = {
       backedUp: put('WhatsApp Images/IMG-1.jpg', 'backed up photo'),
       backedUpCopy: put('WhatsApp Images/Sent/IMG-1.jpg', 'backed up photo'),
+      backedUpCamera: putOutsideWhatsApp('DCIM/Camera/IMG_20240101_101010.jpg', 'backed up photo'),
       trashed: put('WhatsApp Images/IMG-2.jpg', 'photo in the Trash'),
       partial: put('WhatsApp Video/VID-1.mp4', 'partly uploaded video'),
       storageSaver: put('WhatsApp Images/IMG-4.jpg', 'storage saver photo'),
@@ -93,14 +95,16 @@ describe.skipIf(!PYTHON)('phone script and GPTK Phone Check together', () => {
     rmSync(storage, { recursive: true, force: true });
   });
 
-  // The phone deletes exactly the files that GPTK confirmed, and keeps all the others.
+  // The phone deletes the WhatsApp copies of files that GPTK confirmed, keeps the copy outside WhatsApp, and keeps all the others.
   it('deletes on the phone only the files that GPTK confirmed', async () => {
     await scanAndCheck();
 
-    expect(runScript(['clean'], 'yes\n'), 'clean succeeds').toBe(0);
+    // Enter takes the suggestion for the photo with copies, then yes confirms.
+    expect(runScript(['clean'], '\nyes\n'), 'clean succeeds').toBe(0);
 
     expect(existsSync(files.backedUp), 'the backed-up photo is deleted').toBe(false);
     expect(existsSync(files.backedUpCopy), 'its copy in Sent is deleted').toBe(false);
+    expect(existsSync(files.backedUpCamera), 'its copy in the camera folder stays on the phone').toBe(true);
     expect(existsSync(files.trashed), 'a photo whose Google copy is in the Trash is kept').toBe(true);
     expect(existsSync(files.partial), 'a partly uploaded video is kept').toBe(true);
     expect(existsSync(files.storageSaver), 'a photo that Google keeps only in Storage saver quality is kept').toBe(true);
@@ -117,11 +121,11 @@ describe.skipIf(!PYTHON)('phone script and GPTK Phone Check together', () => {
     expect(Object.values(files).every((path) => existsSync(path)), 'every file is still on the phone').toBe(true);
   });
 
-  // Typing anything other than yes at the real prompt keeps every file.
+  // After Enter at the copy question, typing anything other than yes at the last prompt keeps every file.
   it('keeps every file when the answer at the prompt is not yes', async () => {
     await scanAndCheck();
 
-    expect(runScript(['clean'], 'no\n'), 'clean reports that it was cancelled').toBe(1);
+    expect(runScript(['clean'], '\nno\n'), 'clean reports that it was cancelled').toBe(1);
 
     expect(Object.values(files).every((path) => existsSync(path)), 'every file is still on the phone').toBe(true);
   });

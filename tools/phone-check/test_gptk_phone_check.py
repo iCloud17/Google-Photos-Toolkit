@@ -49,12 +49,16 @@ class FakePhone:
     def add_whatsapp(self, relative_path: str, data: bytes) -> str:
         return self.add(f"{WHATSAPP_MEDIA}/{relative_path}", data)
 
-    def run(self, *args, answer: str = "yes", ask=None):
+    def run(self, *args, answers=("yes",), ask=None):
+        """Runs the script. Each question gets the next answer. After the last answer, the input is closed (like Ctrl+D)."""
         asked = []
+        remaining = list(answers)
 
         def default_ask(prompt):
             asked.append(prompt)
-            return answer
+            if not remaining:
+                raise EOFError()
+            return remaining.pop(0)
 
         with contextlib.redirect_stdout(io.StringIO()):
             code = phone.main([*args, "--storage", self.root], ask=ask or default_ask)
@@ -108,7 +112,7 @@ class FakePhone:
         return path
 
     def records(self) -> list:
-        """Rows (path, size, link) of every gptk-deleted-*.txt file."""
+        """Rows (path, size, Google Photos link, copy that stays) of every gptk-deleted-*.txt file."""
         rows = []
         for name in sorted(os.listdir(self.downloads)):
             if name.startswith("gptk-deleted-"):
@@ -119,9 +123,12 @@ class FakePhone:
 
 class PhoneTestCase(unittest.TestCase):
     def setUp(self):
+        self.phone = self.fresh_phone()
+
+    def fresh_phone(self) -> FakePhone:
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.phone = FakePhone(temp.name)
+        return FakePhone(temp.name)
 
 
 class ScanTests(PhoneTestCase):
@@ -218,17 +225,17 @@ class ScanTests(PhoneTestCase):
 
 
 class CleanTests(PhoneTestCase):
-    # After "yes", every copy of a file that is in Google Photos is deleted, and nothing else.
+    # With the suggestion and "yes", every WhatsApp copy of a file that is in Google Photos is deleted, and nothing else.
     def test_clean_deletes_only_files_in_google_photos(self):
         backed_up = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
         backed_up_copy = self.phone.add_whatsapp("WhatsApp Images/Sent/IMG-1.jpg", b"in google photos")
         phone_only = self.phone.add_whatsapp("WhatsApp Images/IMG-2.jpg", b"only on the phone")
         self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
 
-        code, asked = self.phone.run("clean", answer="yes")
+        code, asked = self.phone.run("clean", answers=["", "yes"])
 
         self.assertEqual(code, 0, msg="clean succeeds")
-        self.assertEqual(len(asked), 1, msg="the user is asked once before deleting")
+        self.assertEqual(len(asked), 2, msg="the user is asked about the copies, then once before deleting")
         self.assertFalse(os.path.exists(backed_up), msg="the backed-up file is deleted")
         self.assertFalse(os.path.exists(backed_up_copy), msg="its copy is deleted too")
         self.assertTrue(os.path.exists(phone_only), msg="a file that is not in Google Photos is kept")
@@ -240,7 +247,7 @@ class CleanTests(PhoneTestCase):
 
         for answer in ["", "y", "no", "yes please"]:
             with self.subTest(answer=answer):
-                code, _ = self.phone.run("clean", answer=answer)
+                code, _ = self.phone.run("clean", answers=[answer])
 
                 self.assertEqual(code, 1, msg="clean reports that it was cancelled")
                 self.assertTrue(os.path.exists(backed_up), msg="nothing is deleted without a clear yes")
@@ -384,8 +391,8 @@ class CleanTests(PhoneTestCase):
 
         self.assertEqual(
             self.phone.records(),
-            [[backed_up, str(len(b"in google photos")), "https://photos.google.com/photo/AF1QipBackedUp"]],
-            msg="the record shows the deleted file, its size and where it is in Google Photos",
+            [[backed_up, str(len(b"in google photos")), "https://photos.google.com/photo/AF1QipBackedUp", ""]],
+            msg="the record shows the deleted file, its size, where it is in Google Photos and that no copy stays on the phone",
         )
 
     # When the phone refuses to delete a file, the other files are still deleted and clean reports the problem.
@@ -421,6 +428,353 @@ class CleanTests(PhoneTestCase):
                 self.assertEqual(code, 0, msg="there is simply nothing to do")
                 self.assertEqual(asked, [], msg="the user is not asked")
                 self.assertTrue(os.path.exists(photo), msg="nothing is deleted")
+
+
+class CopyTests(PhoneTestCase):
+    """Files that have more than one copy on the phone."""
+
+    # By default, the copy outside WhatsApp stays and the WhatsApp copy is deleted, in Google Photos or not.
+    def test_suggestion_keeps_the_copy_outside_whatsapp(self):
+        for in_google in (True, False):
+            with self.subTest(in_google=in_google):
+                phone = self.fresh_phone()
+                whatsapp = phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+                camera = phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+                phone.write_result({fingerprint_of(b"photo"): "AF1QipPhoto"} if in_google else {})
+
+                code, _ = phone.run("clean", answers=["", "yes"])
+
+                self.assertEqual(code, 0, msg="clean succeeds")
+                self.assertFalse(os.path.exists(whatsapp), msg="the WhatsApp copy is deleted")
+                self.assertTrue(os.path.exists(camera), msg="the camera copy stays on the phone")
+
+    # In the old WhatsApp folder (not in an app folder), the copy outside WhatsApp stays, also when the WhatsApp copy is older.
+    def test_suggestion_keeps_the_copy_outside_the_old_whatsapp_folder(self):
+        whatsapp = self.phone.add("WhatsApp/Media/WhatsApp Images/IMG-1.jpg", b"photo")
+        os.utime(whatsapp, (time.time() - 86400 * 365, time.time() - 86400 * 365))
+        pictures = self.phone.add("Pictures/IMG_1.jpg", b"photo")
+
+        code, _ = self.phone.run("copies", answers=["", "yes"])
+
+        self.assertEqual(code, 0, msg="copies succeeds")
+        self.assertFalse(os.path.exists(whatsapp), msg="the older WhatsApp copy is deleted")
+        self.assertTrue(os.path.exists(pictures), msg="the copy outside WhatsApp stays on the phone")
+
+    # The suggestion keeps a copy in a gallery folder rather than one in Download, which is often emptied.
+    def test_suggestion_prefers_a_gallery_folder_to_download(self):
+        whatsapp = self.phone.add_whatsapp("WhatsApp Video/VID-1.mp4", b"video")
+        download = self.phone.add("Download/VID-1.mp4", b"video")
+        gallery = self.phone.add("Pictures/Saved/funny video.mp4", b"video")
+
+        code, _ = self.phone.run("copies", answers=["", "yes"])
+
+        self.assertEqual(code, 0, msg="copies succeeds")
+        self.assertTrue(os.path.exists(gallery), msg="the copy in the gallery folder stays")
+        self.assertFalse(os.path.exists(download) or os.path.exists(whatsapp), msg="the other copies are deleted")
+
+    # A copy number keeps only that copy, and each number keeps a different copy.
+    def test_a_number_keeps_only_that_copy(self):
+        kept = set()
+        for number in ("1", "2", "3"):
+            with self.subTest(number=number):
+                phone = self.fresh_phone()
+                copies = [
+                    phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo"),
+                    phone.add_whatsapp("WhatsApp Images/Sent/IMG-1.jpg", b"photo"),
+                    phone.add("Pictures/IMG-1.jpg", b"photo"),
+                ]
+                phone.write_result({})
+
+                code, _ = phone.run("clean", answers=[number, "yes"])
+
+                left = [os.path.relpath(path, phone.root) for path in copies if os.path.exists(path)]
+                self.assertEqual(code, 0, msg="clean succeeds")
+                self.assertEqual(len(left), 1, msg="exactly one copy stays")
+                kept.update(left)
+        self.assertEqual(len(kept), 3, msg="each number keeps a different copy")
+
+    # "skip" keeps every copy, and then there is nothing left to ask.
+    def test_skip_keeps_every_copy(self):
+        copies = [self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo"), self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")]
+        self.phone.write_result({fingerprint_of(b"photo"): "AF1QipPhoto"})
+
+        code, asked = self.phone.run("clean", answers=["skip"])
+
+        self.assertEqual(code, 0, msg="keeping everything is a normal end")
+        self.assertEqual(len(asked), 1, msg="there is no last question when nothing is to be deleted")
+        self.assertTrue(all(os.path.exists(path) for path in copies), msg="every copy is kept")
+
+    # "all" deletes every copy of a file that is in Google Photos, also outside WhatsApp, with no extra question.
+    def test_all_deletes_every_copy_of_a_file_in_google_photos(self):
+        copies = [self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo"), self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")]
+        self.phone.write_result({fingerprint_of(b"photo"): "AF1QipPhoto"})
+
+        code, asked = self.phone.run("clean", answers=["all", "yes"])
+
+        self.assertEqual(code, 0, msg="clean succeeds")
+        self.assertEqual(len(asked), 2, msg="no extra question, because Google Photos has the file")
+        self.assertFalse(any(os.path.exists(path) for path in copies), msg="every copy is deleted")
+
+    # Deleting every copy of a file that Google Photos may not have needs the extra word "delete".
+    def test_all_copies_of_a_file_not_in_google_photos_need_the_word_delete(self):
+        cases = [
+            ("delete", ["all", "delete", "yes"], False),
+            ("Enter", ["all", "", "skip"], True),
+            ("yes", ["all", "yes", "skip"], True),
+        ]
+        for command in ("clean", "copies"):
+            for confirmation, answers, kept in cases:
+                with self.subTest(command=command, confirmation=confirmation):
+                    phone = self.fresh_phone()
+                    copies = [phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo"), phone.add("Download/IMG-1.jpg", b"photo")]
+                    phone.write_result({})
+
+                    phone.run(command, answers=answers)
+
+                    self.assertEqual([os.path.exists(path) for path in copies], [kept, kept], msg="only the word delete allows deleting every copy")
+
+    # Without Google Photos, the suggestion always keeps one copy, also when all copies are in WhatsApp.
+    def test_suggestion_keeps_one_copy_of_a_file_not_in_google_photos(self):
+        for command in ("clean", "copies"):
+            with self.subTest(command=command):
+                phone = self.fresh_phone()
+                copies = [phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo"), phone.add_whatsapp("WhatsApp Images/Sent/IMG-1.jpg", b"photo")]
+                phone.write_result({})
+
+                phone.run(command, answers=["auto", "yes"])
+
+                self.assertEqual(sum(os.path.exists(path) for path in copies), 1, msg="exactly one copy stays")
+
+    # "auto" uses the suggestion for this file and all the next files, without more questions.
+    def test_auto_uses_the_suggestion_for_all_next_files(self):
+        contents = [f"photo {index}".encode() * (index + 1) for index in range(3)]
+        whatsapp = [self.phone.add_whatsapp(f"WhatsApp Images/IMG-{index}.jpg", data) for index, data in enumerate(contents)]
+        camera = [self.phone.add(f"DCIM/Camera/IMG_{index}.jpg", data) for index, data in enumerate(contents)]
+        self.phone.write_result({})
+
+        code, asked = self.phone.run("clean", answers=["auto", "yes"])
+
+        self.assertEqual(code, 0, msg="clean succeeds")
+        self.assertEqual(len(asked), 2, msg="after auto, only the last question is asked")
+        self.assertFalse(any(os.path.exists(path) for path in whatsapp), msg="each WhatsApp copy is deleted, as suggested")
+        self.assertTrue(all(os.path.exists(path) for path in camera), msg="each camera copy stays, as suggested")
+
+    # "stop" keeps all copies of this file and the next files, but a file that is only in Google Photos is still deleted.
+    def test_stop_keeps_the_copies_of_all_next_files(self):
+        single = self.phone.add_whatsapp("WhatsApp Images/IMG-0.jpg", b"only copy, in google photos")
+        copies = [self.phone.add_whatsapp(f"WhatsApp Images/IMG-{index}.jpg", f"photo {index}".encode()) for index in (1, 2)]
+        copies += [self.phone.add(f"DCIM/Camera/IMG_{index}.jpg", f"photo {index}".encode()) for index in (1, 2)]
+        self.phone.write_result({fingerprint_of(b"only copy, in google photos"): "AF1QipSingle"})
+
+        code, asked = self.phone.run("clean", answers=["stop", "yes"])
+
+        self.assertEqual(code, 0, msg="clean succeeds")
+        self.assertEqual(len(asked), 2, msg="after stop, only the last question is asked")
+        self.assertFalse(os.path.exists(single), msg="the file that is in Google Photos is deleted")
+        self.assertTrue(all(os.path.exists(path) for path in copies), msg="every copy is kept")
+
+    # Closing the input (or Ctrl+C) during the questions about copies stops at once and deletes nothing, also no file that is in Google Photos.
+    def test_closing_the_input_during_the_questions_deletes_nothing(self):
+        paths = [
+            self.phone.add_whatsapp("WhatsApp Images/IMG-0.jpg", b"only copy, in google photos"),
+            self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo"),
+            self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo"),
+        ]
+        self.phone.write_result({fingerprint_of(b"only copy, in google photos"): "AF1QipSingle"})
+
+        for error in (EOFError, KeyboardInterrupt):
+            with self.subTest(error=error.__name__):
+                asked = []
+
+                # Only the first question is interrupted. A later "yes" must not be asked for.
+                def ask(prompt, error=error):
+                    asked.append(prompt)
+                    if len(asked) == 1:
+                        raise error()
+                    return "yes"
+
+                code, _ = self.phone.run("clean", ask=ask)
+
+                self.assertEqual(code, 1, msg="clean reports that it was cancelled")
+                self.assertEqual(len(asked), 1, msg="no question is asked after the interruption")
+                self.assertTrue(all(os.path.exists(path) for path in paths), msg="nothing is deleted")
+
+    # After the questions about copies, any answer other than "yes" at the end deletes nothing.
+    def test_no_at_the_end_deletes_nothing(self):
+        copies = [self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo"), self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")]
+        self.phone.write_result({})
+
+        code, _ = self.phone.run("clean", answers=["1", "no"])
+
+        self.assertEqual(code, 1, msg="clean reports that it was cancelled")
+        self.assertTrue(all(os.path.exists(path) for path in copies), msg="nothing is deleted without a clear yes")
+
+    # An answer that is not one of the choices asks the question again and chooses nothing.
+    def test_an_unknown_answer_asks_again(self):
+        whatsapp = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+        camera = self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+        self.phone.write_result({})
+
+        code, asked = self.phone.run("clean", answers=["maybe", "yes", "0", "3", "-1", "1.5", "", "yes"])
+
+        self.assertEqual(code, 0, msg="clean succeeds")
+        self.assertEqual(len(asked), 8, msg="each unknown answer asks the question again")
+        self.assertFalse(os.path.exists(whatsapp), msg="Enter after the unknown answers uses the suggestion")
+        self.assertTrue(os.path.exists(camera), msg="the suggested copy stays")
+
+    # When the copy that is to stay changes or disappears before the deletion, the other copy is kept too.
+    def test_copies_stay_when_the_copy_to_keep_changes(self):
+        for change in ("edited", "deleted"):
+            with self.subTest(change=change):
+                phone = self.fresh_phone()
+                whatsapp = phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+                camera = phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+                phone.write_result({})
+                answers = ["", "yes"]
+
+                def ask(_prompt, change=change, phone=phone, camera=camera, answers=answers):
+                    answer = answers.pop(0)
+                    if answer == "yes" and change == "edited":
+                        phone.add("DCIM/Camera/IMG_1.jpg", b"edited photo")
+                    elif answer == "yes":
+                        os.remove(camera)
+                    return answer
+
+                code, _ = phone.run("clean", ask=ask)
+
+                self.assertEqual(code, 0, msg="keeping files for safety is not an error")
+                self.assertTrue(os.path.exists(whatsapp), msg="the WhatsApp copy is kept, because the copy that was to stay changed")
+
+    # A copy that turns into a second name of the copy that stays is not deleted.
+    def test_a_copy_that_became_the_copy_to_keep_is_not_deleted(self):
+        whatsapp = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+        camera = self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+        self.phone.write_result({})
+        answers = ["", "yes"]
+
+        def ask(_prompt):
+            answer = answers.pop(0)
+            if answer == "yes":
+                os.remove(whatsapp)
+                os.link(camera, whatsapp)
+            return answer
+
+        self.phone.run("clean", ask=ask)
+
+        self.assertTrue(os.path.exists(whatsapp), msg="a name of the copy that stays is not deleted")
+        self.assertEqual(self.phone.records(), [], msg="the record lists no deleted file")
+
+    # Copies in hidden, trash and app folders (Android/...) do not count, because they can disappear.
+    def test_copies_in_hidden_trash_and_app_folders_do_not_count(self):
+        whatsapp = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+        places = (
+            "DCIM/.thumbnails/IMG-1.jpg",
+            "Pictures/.trashed-1700000000-IMG-1.jpg",
+            "Pictures/Trash/IMG-1.jpg",
+            "DCIM/RecycleBin/IMG-1.jpg",
+            "Android/data/com.example.gallery/files/IMG-1.jpg",
+            "Android/obb/com.example.game/IMG-1.jpg",
+            "Android/media/org.telegram.messenger/Telegram/Telegram Images/IMG-1.jpg",
+        )
+        others = [self.phone.add(place, b"photo") for place in places]
+        self.phone.write_result({})
+
+        code, asked = self.phone.run("clean", answers=[])
+
+        self.assertEqual(code, 0, msg="there is nothing to do")
+        self.assertEqual(asked, [], msg="no copies are offered")
+        self.assertTrue(all(os.path.exists(path) for path in [whatsapp, *others]), msg="nothing is deleted")
+
+    # With --folder, a copy in a trash folder inside that folder is never the copy that stays, also when it is the oldest.
+    def test_a_trash_folder_inside_the_chosen_folder_is_skipped(self):
+        trash = self.phone.add("Pictures/Trash/IMG_1.jpg", b"photo")
+        os.utime(trash, (time.time() - 86400 * 365, time.time() - 86400 * 365))
+        copies = [self.phone.add("Pictures/IMG_1.jpg", b"photo"), self.phone.add("Pictures/Saved/IMG_1.jpg", b"photo")]
+
+        code, _ = self.phone.run("copies", "--folder", "Pictures", answers=["", "yes"])
+
+        self.assertEqual(code, 0, msg="copies succeeds")
+        self.assertTrue(any(os.path.exists(path) for path in copies), msg="a copy outside the trash folder stays on the phone")
+        self.assertTrue(os.path.exists(trash), msg="the script does not touch files in a trash folder")
+
+    # Another name of the same file (a hard link or a link) is not a copy.
+    def test_links_are_not_copies(self):
+        for kind, make_link in (("hard link", os.link), ("link", os.symlink)):
+            with self.subTest(kind=kind):
+                phone = self.fresh_phone()
+                whatsapp = phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+                other = phone.path("DCIM/Camera/IMG_1.jpg")
+                os.makedirs(os.path.dirname(other))
+                make_link(whatsapp, other)
+                phone.write_result({})
+
+                code, asked = phone.run("clean", answers=[])
+
+                self.assertEqual(code, 0, msg="there is nothing to do")
+                self.assertEqual(asked, [], msg="no copies are offered")
+                self.assertTrue(os.path.exists(whatsapp) and os.path.lexists(other), msg="nothing is deleted")
+
+    # A file with the same size but other content is not a copy.
+    def test_a_file_with_other_content_is_not_a_copy(self):
+        paths = [self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo A"), self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo B")]
+        self.phone.write_result({})
+
+        code, asked = self.phone.run("clean", answers=[])
+
+        self.assertEqual(code, 0, msg="there is nothing to do")
+        self.assertEqual(asked, [], msg="no copies are offered")
+        self.assertTrue(all(os.path.exists(path) for path in paths), msg="nothing is deleted")
+
+    # Copies that are all outside WhatsApp are not offered, because only WhatsApp files are checked.
+    def test_copies_outside_whatsapp_are_left_alone(self):
+        paths = [
+            self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo A"),
+            self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo B"),
+            self.phone.add("Download/IMG_1.jpg", b"photo B"),
+        ]
+        self.phone.write_result({})
+
+        code, asked = self.phone.run("clean", answers=[])
+
+        self.assertEqual(code, 0, msg="there is nothing to do")
+        self.assertEqual(asked, [], msg="no copies are offered")
+        self.assertTrue(all(os.path.exists(path) for path in paths), msg="nothing is deleted")
+
+    # The record names the copy that stays on the phone for each deleted copy.
+    def test_record_names_the_copy_that_stays(self):
+        whatsapp = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+        camera = self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+        self.phone.write_result({})
+
+        self.phone.run("clean", answers=["", "yes"])
+
+        self.assertEqual(
+            self.phone.records(),
+            [[whatsapp, str(len(b"photo")), "", camera]],
+            msg="the record shows the deleted copy, its size, no Google Photos link and the copy that stays",
+        )
+
+    # The copies command needs no Google Photos result, and by default the copy outside WhatsApp stays.
+    def test_copies_command_needs_no_result(self):
+        whatsapp = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+        camera = self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+
+        code, _ = self.phone.run("copies", answers=["", "yes"])
+
+        self.assertEqual(code, 0, msg="copies succeeds")
+        self.assertFalse(os.path.exists(whatsapp), msg="the WhatsApp copy is deleted")
+        self.assertTrue(os.path.exists(camera), msg="the camera copy stays on the phone")
+
+    # Without a WhatsApp folder, the copies command stops and deletes nothing.
+    def test_copies_command_without_folders_fails(self):
+        camera = self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+        self.phone.add("Download/IMG_1.jpg", b"photo")
+
+        code, asked = self.phone.run("copies", answers=[])
+
+        self.assertEqual(code, 2, msg="copies reports that it found no folder")
+        self.assertEqual(asked, [], msg="the user is not asked")
+        self.assertTrue(os.path.exists(camera), msg="nothing is deleted")
 
 
 if __name__ == "__main__":

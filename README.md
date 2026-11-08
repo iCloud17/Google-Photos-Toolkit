@@ -38,14 +38,15 @@ As simple as selecting "Library" source, clicking `Move to trash`, then clearing
 
 ### Freeing phone space (Phone Check)
 
-Phone Check finds photos and videos on your Android phone (for example, in the WhatsApp folder) that are already in your Google Photos. Then a small script deletes only those phone copies.
+Phone Check finds photos and videos on your Android phone (for example, in the WhatsApp folder) that are already in your Google Photos, and extra copies of them in other folders of the phone. Then a small script deletes only the files that you choose.
 
 Safety and privacy:
 
 - The phone script ([`tools/phone-check/gptk_phone_check.py`](tools/phone-check/gptk_phone_check.py)) uses only the Python standard library. It does not connect to the internet.
 - GPTK sends only fingerprints (SHA-1 hashes) to Google Photos, in your own logged-in session. It does not send files or file names. Phone Check changes nothing in Google Photos.
 - A file counts as "already in Google Photos" only if Google Photos has an identical copy in Original quality that is saved in your library, fully uploaded, and not in the Trash. If GPTK cannot check a file, the file stays on the phone.
-- The script deletes nothing until you type `yes`. Just before it deletes a file, it reads the file again to make sure that it did not change. It writes the list of deleted files, with their Google Photos links, to `Download/gptk-deleted-*.txt`.
+- For each file that has more than one copy on the phone, the script shows the name, date and folder of every copy, and you choose what stays. A file that is not confirmed in Google Photos always keeps 1 copy on the phone, unless you type `all` and then `delete` for that file.
+- The script deletes nothing until you type `yes`. Just before it deletes a file, it reads the file again (and the copy that stays) to make sure that nothing changed. It writes the list of deleted files, with their Google Photos links and the copy that stays, to `Download/gptk-deleted-*.txt`.
 
 You need, on the phone: Firefox with Violentmonkey (or Tampermonkey) and GPTK, and [Termux](https://termux.dev) from F-Droid or GitHub.
 
@@ -53,13 +54,24 @@ You need, on the phone: Firefox with Violentmonkey (or Tampermonkey) and GPTK, a
 2. Run `pkg install python curl`. Then download the script: `curl -L -o gptk_phone_check.py https://raw.githubusercontent.com/iCloud17/Google-Photos-Toolkit/main/tools/phone-check/gptk_phone_check.py`
 3. Run `python gptk_phone_check.py scan`. It writes `Download/gptk-fingerprints.json`.
 4. In Firefox, open photos.google.com, open GPTK, then open `Phone Check`. Choose `gptk-fingerprints.json`, tap `Check`, then tap `Download Result`. Always download the result, also when nothing is found, so that it replaces any older result.
-5. In Termux, run `python gptk_phone_check.py clean`. Read the summary, then type `yes` to delete the files. The result file is valid for 2 days, and only for the last scan. If you scan again, check the new `gptk-fingerprints.json` in GPTK again.
+5. In Termux, run `python gptk_phone_check.py clean`. The result file is valid for 2 days, and only for the last scan. If you scan again, check the new `gptk-fingerprints.json` in GPTK again.
+6. The script looks for copies in the other folders of the phone (this can take a few minutes). For each file with more than one copy, type one of these answers:
+   - a copy number: keep only that copy and delete the other copies.
+   - `all`: delete all copies. If Google Photos does not have the file, you must also type `delete`.
+   - `skip`: keep all copies.
+   - `auto`: use the suggestion for this file and all the next files.
+   - `stop`: keep all copies of this file and all the next files.
+   - Enter: use the suggestion. It keeps a copy outside WhatsApp if there is one (not in Download if possible, then the oldest). It deletes all copies only if Google Photos has the file and all copies are in WhatsApp.
+7. Read the summary, then type `yes` to delete the files.
 
-Options: `--folder "Pictures/Screenshots"` checks a different folder (relative to the phone storage, can be repeated). Use the same `--folder` options for `scan` and `clean`. `clean --list` shows each file before you confirm. To try it safely first, use a small test folder.
+To look only for copies, without Google Photos (no steps 3 and 4), run `python gptk_phone_check.py copies`.
+
+Options: `--folder "Pictures/Screenshots"` checks a different folder (relative to the phone storage, can be repeated). Use the same `--folder` options for `scan` and `clean`. `--list` (for `clean` and `copies`) shows each file before you confirm. To try it safely first, use a small test folder.
 
 Limits:
 
 - Only identical copies are found. Edited or re-saved copies are not found, so they stay on the phone.
+- Copies are searched only in the internal storage, not on an SD card. The script skips hidden files and folders and trash and recycle bin folders everywhere (also in the WhatsApp or `--folder` folders), and it does not search app folders (`Android/...`) for copies. Files there can disappear, so they never count as a copy.
 - Files whose Google Photos copy is in Storage saver quality stay on the phone, because that copy is smaller than the original.
 - After you delete WhatsApp media, WhatsApp chats show it as not available. The copies stay in Google Photos.
 - If Google Photos already backs up the folder, the Google Photos app's "Free up space" can do a similar cleanup.
