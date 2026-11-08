@@ -599,6 +599,15 @@
             flex: 1 1 auto;
         }
 
+        .phone-check-form {
+            flex-shrink: 0;
+
+            input[type="file"] {
+                max-width: 100%;
+                font-size: 12px;
+            }
+        }
+
         .settings-form {
             margin-bottom: 4px;
             flex-shrink: 0;

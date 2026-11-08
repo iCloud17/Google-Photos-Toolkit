@@ -1,7 +1,7 @@
 {
   "name": "google-photos-toolkit",
   "nameFull": "Google Photos Toolkit",
-  "version": "3.3.0",
+  "version": "3.4.0",
   "description": "Bulk organize your media",
   "userScript": {
     "namespace": "https://github.com/xob0t/Google-Photos-Toolkit",
@@ -9,7 +9,7 @@
       "*://photos.google.com/*"
     ],
     "icon": "https://raw.githubusercontent.com/xob0t/Google-Photos-Toolkit/main/media/icon.png",
-    "downloadURL": "https://github.com/xob0t/Google-Photos-Toolkit/releases/latest/download/google_photos_toolkit.user.js",
+    "downloadURL": "https://github.com/iCloud17/Google-Photos-Toolkit/releases/latest/download/google_photos_toolkit.user.js",
     "run-at": "body",
     "grant": [
       "GM_registerMenuCommand",
@@ -26,7 +26,8 @@
     "lint": "eslint src",
     "lint:fix": "eslint src --fix",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:phone-script": "python3 -m unittest discover -s tools/phone-check -v"
   },
   "keywords": [],
   "author": "xob0t",

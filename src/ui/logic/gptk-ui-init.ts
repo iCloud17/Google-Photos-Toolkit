@@ -9,6 +9,7 @@ import controlButtonsListeners from './main-control-buttons';
 import advancedSettingsListenersSetUp from './advanced-settings';
 import filterListenersSetUp from './filter-listeners';
 import registerMenuCommand from './register-menu-command';
+import phoneCheckListenersSetUp from './phone-check';
 import type { Album } from '../../types';
 
 export default function initUI(): void {
@@ -19,6 +20,7 @@ export default function initUI(): void {
   controlButtonsListeners();
   albumSelectsControlsSetUp();
   advancedSettingsListenersSetUp();
+  phoneCheckListenersSetUp();
   updateUI();
 
   const cachedAlbums = getFromStorage<Album[]>('albums');

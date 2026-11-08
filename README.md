@@ -12,7 +12,7 @@ In your browser, utilizing GP's undocumented web api
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) userscript manager for your browser
    - If you're on Android, try [Firefox](https://www.mozilla.org/firefox/browsers/mobile/android/), it supports Tampermonkey
-2. Click [Install](https://github.com/xob0t/Google-Photos-Toolkit/releases/latest/download/google_photos_toolkit.user.js)
+2. Click [Install](https://github.com/iCloud17/Google-Photos-Toolkit/releases/latest/download/google_photos_toolkit.user.js)
 3. Accept installation
 
 ### Finding space-consuming media
@@ -35,6 +35,37 @@ Media with similar thumbnails will be added to the album.
 ### Deleting all media in the library
 
 As simple as selecting "Library" source, clicking `Move to trash`, then clearing it.
+
+### Freeing phone space (Phone Check)
+
+Phone Check finds photos and videos on your Android phone (for example, in the WhatsApp folder) that are already in your Google Photos. Then a small script deletes only those phone copies.
+
+Safety and privacy:
+
+- The phone script ([`tools/phone-check/gptk_phone_check.py`](tools/phone-check/gptk_phone_check.py)) uses only the Python standard library. It does not connect to the internet.
+- GPTK sends only fingerprints (SHA-1 hashes) to Google Photos, in your own logged-in session. It does not send files or file names. Phone Check changes nothing in Google Photos.
+- A file counts as "already in Google Photos" only if Google Photos has an identical copy in Original quality that is saved in your library, fully uploaded, and not in the Trash. If GPTK cannot check a file, the file stays on the phone.
+- The script deletes nothing until you type `yes`. Just before it deletes a file, it reads the file again to make sure that it did not change. It writes the list of deleted files, with their Google Photos links, to `Download/gptk-deleted-*.txt`.
+
+You need, on the phone: Firefox with Violentmonkey (or Tampermonkey) and GPTK, and [Termux](https://termux.dev) from F-Droid or GitHub.
+
+1. In Termux, run `termux-setup-storage` and allow file access ("All files access" on Android 11 and later).
+2. Run `pkg install python`. Get `gptk_phone_check.py` from the [Releases](https://github.com/iCloud17/Google-Photos-Toolkit/releases) page.
+3. Run `python gptk_phone_check.py scan`. It writes `Download/gptk-fingerprints.json`.
+4. In Firefox, open photos.google.com, open GPTK, then open `Phone Check`. Choose `gptk-fingerprints.json`, tap `Check`, then tap `Download Result`. Always download the result, also when nothing is found, so that it replaces any older result.
+5. In Termux, run `python gptk_phone_check.py clean`. Read the summary, then type `yes` to delete the files. The result file is valid for 2 days, and only for the last scan. If you scan again, check the new `gptk-fingerprints.json` in GPTK again.
+
+Options: `--folder "Pictures/Screenshots"` checks a different folder (relative to the phone storage, can be repeated). Use the same `--folder` options for `scan` and `clean`. `clean --list` shows each file before you confirm. To try it safely first, use a small test folder.
+
+Limits:
+
+- Only identical copies are found. Edited or re-saved copies are not found, so they stay on the phone.
+- Files whose Google Photos copy is in Storage saver quality stay on the phone, because that copy is smaller than the original.
+- After you delete WhatsApp media, WhatsApp chats show it as not available. The copies stay in Google Photos.
+- If Google Photos already backs up the folder, the Google Photos app's "Free up space" can do a similar cleanup.
+- Phone Check uses Google Photos' undocumented web API. If Google changes it, Phone Check most likely shows "Could not check" and the script deletes nothing.
+
+Tests: `pnpm test` (includes an end-to-end test with the Python script) and `pnpm test:phone-script`.
 
 ### Use GPTK's api
 
