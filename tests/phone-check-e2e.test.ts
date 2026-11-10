@@ -95,20 +95,46 @@ describe.skipIf(!PYTHON)('phone script and GPTK Phone Check together', () => {
     rmSync(storage, { recursive: true, force: true });
   });
 
-  // The phone deletes the WhatsApp copies of files that GPTK confirmed, keeps the copy outside WhatsApp, and keeps all the others.
-  it('deletes on the phone only the files that GPTK confirmed', async () => {
+  // The phone moves away the WhatsApp copies of files that GPTK confirmed, keeps the copy outside WhatsApp, and keeps all the others.
+  it('moves away on the phone only the files that GPTK confirmed', async () => {
     await scanAndCheck();
 
     // Enter takes the suggestion for the photo with copies, then yes confirms.
     expect(runScript(['clean'], '\nyes\n'), 'clean succeeds').toBe(0);
 
-    expect(existsSync(files.backedUp), 'the backed-up photo is deleted').toBe(false);
-    expect(existsSync(files.backedUpCopy), 'its copy in Sent is deleted').toBe(false);
+    expect(existsSync(files.backedUp), 'the backed-up photo is moved away').toBe(false);
+    expect(existsSync(files.backedUpCopy), 'its copy in Sent is moved away').toBe(false);
     expect(existsSync(files.backedUpCamera), 'its copy in the camera folder stays on the phone').toBe(true);
     expect(existsSync(files.trashed), 'a photo whose Google copy is in the Trash is kept').toBe(true);
     expect(existsSync(files.partial), 'a partly uploaded video is kept').toBe(true);
     expect(existsSync(files.storageSaver), 'a photo that Google keeps only in Storage saver quality is kept').toBe(true);
     expect(existsSync(files.phoneOnly), 'a photo that is not in Google Photos is kept').toBe(true);
+  });
+
+  // undo puts every moved file back, and only empty with yes deletes the moved files for good.
+  it('puts the files back with undo and deletes them for good with empty', async () => {
+    await scanAndCheck();
+    const holding = join(storage, 'Download', 'GPTK-deleted');
+    expect(runScript(['clean'], '\nyes\n'), 'clean succeeds').toBe(0);
+    expect(existsSync(holding), 'the moved files wait in GPTK-deleted').toBe(true);
+
+    expect(runScript(['undo']), 'undo succeeds').toBe(0);
+
+    expect(Object.values(files).every((path) => existsSync(path)), 'every file is back in its place').toBe(true);
+    expect(readFileSync(files.backedUp, 'utf8'), 'a file that came back is unchanged').toBe('backed up photo');
+    expect(existsSync(holding), 'the empty GPTK-deleted folder is removed').toBe(false);
+
+    expect(runScript(['clean'], '\nyes\n'), 'the second clean succeeds').toBe(0);
+    expect(runScript(['empty'], 'no\n'), 'empty without yes is cancelled').toBe(1);
+    expect(existsSync(holding), 'the moved files are still in GPTK-deleted').toBe(true);
+
+    expect(runScript(['empty'], 'yes\n'), 'empty succeeds').toBe(0);
+
+    expect(existsSync(holding), 'GPTK-deleted is removed when it is empty').toBe(false);
+    expect(existsSync(files.backedUp) || existsSync(files.backedUpCopy), 'the backed-up WhatsApp copies are gone').toBe(false);
+    expect(existsSync(files.backedUpCamera), 'the camera copy stays on the phone').toBe(true);
+    expect(runScript(['undo']), 'undo after empty has nothing to do').toBe(0);
+    expect(existsSync(files.backedUp), 'a file deleted by empty does not come back').toBe(false);
   });
 
   // A result of an earlier scan is refused after a new scan, so an outdated check can never delete files.

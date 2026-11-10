@@ -3,12 +3,16 @@
 import base64
 import contextlib
 import datetime as dt
+import errno
 import hashlib
 import io
 import json
 import os
+import random
+import stat
 import tempfile
 import time
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -111,14 +115,55 @@ class FakePhone:
             handle.write(text)
         return path
 
-    def records(self) -> list:
-        """Rows (path, size, Google Photos link, copy that stays) of every gptk-deleted-*.txt file."""
-        rows = []
-        for name in sorted(os.listdir(self.downloads)):
-            if name.startswith("gptk-deleted-"):
-                with open(os.path.join(self.downloads, name), encoding="utf-8") as handle:
-                    rows += [line.rstrip("\n").split("\t") for line in handle if not line.startswith("#")]
-        return rows
+    def holding(self) -> str:
+        """The folder where "yes" moves the files to."""
+        return os.path.join(self.downloads, "GPTK-deleted")
+
+    def batches(self) -> list:
+        """The folders in GPTK-deleted, one for each "yes", oldest first."""
+        if not os.path.isdir(self.holding()):
+            return []
+        return sorted(name for name in os.listdir(self.holding()) if os.path.isdir(os.path.join(self.holding(), name)))
+
+    def moved_list(self) -> list:
+        """The entries of the lists of moved files in GPTK-deleted, oldest first."""
+        entries = []
+        for batch in self.batches():
+            list_path = os.path.join(self.holding(), batch, "moved-files.json")
+            if os.path.exists(list_path):
+                with open(list_path, encoding="utf-8") as handle:
+                    entries += [dict(entry, batch=batch) for entry in json.load(handle)["files"]]
+        return entries
+
+    def held_files(self) -> list:
+        """(folder, name, content) of each file that GPTK-deleted holds, without the lists of moved files."""
+        found = []
+        for batch in self.batches():
+            for name in sorted(os.listdir(os.path.join(self.holding(), batch))):
+                if name != "moved-files.json":
+                    with open(os.path.join(self.holding(), batch, name), "rb") as handle:
+                        found.append((batch, name, handle.read()))
+        return found
+
+    def held_contents(self) -> list:
+        return sorted(content for _, _, content in self.held_files())
+
+    def snapshot(self) -> dict:
+        """Path -> (content, modified time) of each file on the phone, without GPTK-deleted and the GPTK files in Download."""
+        files = {}
+        for current, dirs, names in os.walk(self.root):
+            if current == self.downloads:
+                dirs[:] = [name for name in dirs if name != "GPTK-deleted"]
+            for name in names:
+                path = os.path.join(current, name)
+                if current == self.downloads and name.startswith("gptk-"):
+                    continue
+                if os.path.islink(path):
+                    files[path] = ("link", os.readlink(path))
+                else:
+                    with open(path, "rb") as handle:
+                        files[path] = (handle.read(), os.lstat(path).st_mtime_ns)
+        return files
 
 
 class PhoneTestCase(unittest.TestCase):
@@ -381,8 +426,35 @@ class CleanTests(PhoneTestCase):
         self.assertTrue(os.path.exists(outside), msg="the file outside the WhatsApp folder is kept")
         self.assertTrue(os.path.lexists(link), msg="the link itself is not touched")
 
-    # The record lists every deleted file with its Google Photos link.
-    def test_clean_records_deleted_files(self):
+    # A file that is replaced by a link while the question is open stays where it is.
+    def test_a_file_that_became_a_link_is_not_moved(self):
+        for case in ("link to the copy that stays", "link to a file in Google Photos"):
+            with self.subTest(case=case):
+                device = self.fresh_phone()
+                whatsapp = device.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+                if case == "link to the copy that stays":
+                    target = device.add("DCIM/Camera/IMG_1.jpg", b"photo")
+                    device.write_result({})
+                else:
+                    target = device.add(".private/IMG_1.jpg", b"photo")
+                    device.write_result({fingerprint_of(b"photo"): "AF1QipPhoto"})
+                answers = ["", "yes"] if case == "link to the copy that stays" else ["yes"]
+
+                def ask(_prompt, whatsapp=whatsapp, target=target, answers=answers):
+                    answer = answers.pop(0)
+                    if answer == "yes":
+                        os.remove(whatsapp)
+                        os.symlink(target, whatsapp)
+                    return answer
+
+                device.run("clean", ask=ask)
+
+                self.assertTrue(os.path.islink(whatsapp), msg="the link stays in the WhatsApp folder")
+                self.assertTrue(os.path.exists(target), msg="the file that the link leads to stays on the phone")
+                self.assertEqual(device.held_files(), [], msg="no file is moved")
+
+    # The list of moved files shows where each file was and where it is in Google Photos.
+    def test_moved_list_shows_each_file_and_its_google_photos_link(self):
         backed_up = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
         self.phone.add_whatsapp("WhatsApp Images/IMG-2.jpg", b"only on the phone")
         self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
@@ -390,30 +462,31 @@ class CleanTests(PhoneTestCase):
         self.phone.run("clean")
 
         self.assertEqual(
-            self.phone.records(),
-            [[backed_up, str(len(b"in google photos")), "https://photos.google.com/photo/AF1QipBackedUp", ""]],
-            msg="the record shows the deleted file, its size, where it is in Google Photos and that no copy stays on the phone",
+            [(entry["from"], entry["size"], entry["googlePhotos"], entry["keptCopy"]) for entry in self.phone.moved_list()],
+            [(backed_up, len(b"in google photos"), "https://photos.google.com/photo/AF1QipBackedUp", None)],
+            msg="the list shows the moved file, its size, where it is in Google Photos and that no copy stays on the phone",
         )
 
-    # When the phone refuses to delete a file, the other files are still deleted and clean reports the problem.
-    def test_clean_reports_files_it_could_not_delete(self):
+    # When the phone refuses to move a file, the other files are still moved and clean reports the problem.
+    def test_clean_reports_files_it_could_not_move(self):
         locked = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"first photo")
         free = self.phone.add_whatsapp("WhatsApp Images/IMG-2.jpg", b"second photo")
         self.phone.write_result({fingerprint_of(b"first photo"): "AF1QipFirst", fingerprint_of(b"second photo"): "AF1QipSecond"})
-        real_remove = os.remove
+        real_rename = os.rename
 
-        def remove(path):
-            if path == locked:
+        def rename(source, target):
+            if source == locked:
                 raise PermissionError("not allowed")
-            real_remove(path)
+            real_rename(source, target)
 
-        with mock.patch.object(phone.os, "remove", side_effect=remove):
+        with mock.patch.object(phone.os, "rename", side_effect=rename):
             code, _ = self.phone.run("clean")
 
-        self.assertEqual(code, 3, msg="clean reports that some files could not be deleted")
+        self.assertEqual(code, 3, msg="clean reports that some files could not be moved")
         self.assertTrue(os.path.exists(locked), msg="the refused file is still there")
-        self.assertFalse(os.path.exists(free), msg="the other file is deleted")
-        self.assertEqual([row[0] for row in self.phone.records()], [free], msg="the record lists only files that were really deleted")
+        self.assertFalse(os.path.exists(free), msg="the other file is moved")
+        self.assertEqual(self.phone.held_contents(), [b"second photo"], msg="GPTK-deleted holds only the moved file")
+        self.assertEqual([entry["from"] for entry in self.phone.moved_list()], [free], msg="the list names only files that really moved")
 
     # When no phone file matches, nothing is asked and nothing is deleted.
     def test_clean_with_no_matching_files_asks_nothing(self):
@@ -471,6 +544,22 @@ class CopyTests(PhoneTestCase):
         self.assertEqual(code, 0, msg="copies succeeds")
         self.assertTrue(os.path.exists(gallery), msg="the copy in the gallery folder stays")
         self.assertFalse(os.path.exists(download) or os.path.exists(whatsapp), msg="the other copies are deleted")
+
+    # Among copies in equally good places, the suggestion keeps the oldest one, which is usually the original.
+    def test_suggestion_keeps_the_oldest_copy(self):
+        for older in ("DCIM/Camera/IMG_1.jpg", "Pictures/Saved/photo copy.jpg"):
+            with self.subTest(older=older):
+                device = self.fresh_phone()
+                whatsapp = device.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+                others = [device.add("DCIM/Camera/IMG_1.jpg", b"photo"), device.add("Pictures/Saved/photo copy.jpg", b"photo")]
+                past = time.time() - 86400 * 365
+                os.utime(device.path(older), (past, past))
+
+                code, _ = device.run("copies", answers=["", "yes"])
+
+                left = [path for path in [whatsapp, *others] if os.path.exists(path)]
+                self.assertEqual(code, 0, msg="copies succeeds")
+                self.assertEqual(left, [device.path(older)], msg="only the oldest copy stays on the phone")
 
     # A copy number keeps only that copy, and each number keeps a different copy.
     def test_a_number_keeps_only_that_copy(self):
@@ -662,7 +751,8 @@ class CopyTests(PhoneTestCase):
         self.phone.run("clean", ask=ask)
 
         self.assertTrue(os.path.exists(whatsapp), msg="a name of the copy that stays is not deleted")
-        self.assertEqual(self.phone.records(), [], msg="the record lists no deleted file")
+        self.assertEqual(self.phone.held_files(), [], msg="no file is moved")
+        self.assertFalse(os.path.exists(self.phone.holding()), msg="no empty GPTK-deleted folder is left behind")
 
     # Copies in hidden, trash and app folders (Android/...) do not count, because they can disappear.
     def test_copies_in_hidden_trash_and_app_folders_do_not_count(self):
@@ -740,8 +830,8 @@ class CopyTests(PhoneTestCase):
         self.assertEqual(asked, [], msg="no copies are offered")
         self.assertTrue(all(os.path.exists(path) for path in paths), msg="nothing is deleted")
 
-    # The record names the copy that stays on the phone for each deleted copy.
-    def test_record_names_the_copy_that_stays(self):
+    # The list of moved files names the copy that stays on the phone for each moved copy.
+    def test_moved_list_names_the_copy_that_stays(self):
         whatsapp = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
         camera = self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
         self.phone.write_result({})
@@ -749,9 +839,9 @@ class CopyTests(PhoneTestCase):
         self.phone.run("clean", answers=["", "yes"])
 
         self.assertEqual(
-            self.phone.records(),
-            [[whatsapp, str(len(b"photo")), "", camera]],
-            msg="the record shows the deleted copy, its size, no Google Photos link and the copy that stays",
+            [(entry["from"], entry["googlePhotos"], entry["keptCopy"]) for entry in self.phone.moved_list()],
+            [(whatsapp, None, camera)],
+            msg="the list shows the moved copy, no Google Photos link and the copy that stays",
         )
 
     # The copies command needs no Google Photos result, and by default the copy outside WhatsApp stays.
@@ -775,6 +865,596 @@ class CopyTests(PhoneTestCase):
         self.assertEqual(code, 2, msg="copies reports that it found no folder")
         self.assertEqual(asked, [], msg="the user is not asked")
         self.assertTrue(os.path.exists(camera), msg="nothing is deleted")
+
+
+class SafetyNetTests(PhoneTestCase):
+    """"yes" only moves the files to Download/GPTK-deleted. "undo" puts them back. "empty" deletes them for good."""
+
+    def read(self, path: str) -> bytes:
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    # "yes" moves the files to GPTK-deleted, unchanged, in a folder that gallery apps do not show.
+    def test_yes_moves_the_files_to_gptk_deleted(self):
+        backed_up = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        whatsapp = self.phone.add_whatsapp("WhatsApp Video/VID-1.mp4", b"video")
+        camera = self.phone.add("DCIM/Camera/VID_1.mp4", b"video")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+
+        code, _ = self.phone.run("clean", answers=["", "yes"])
+
+        self.assertEqual(code, 0, msg="clean succeeds")
+        self.assertFalse(os.path.exists(backed_up) or os.path.exists(whatsapp), msg="the files are no longer in WhatsApp")
+        self.assertEqual(self.phone.held_contents(), [b"in google photos", b"video"], msg="GPTK-deleted holds the moved files, unchanged")
+        self.assertEqual(self.read(camera), b"video", msg="the copy that stays is not moved")
+        self.assertTrue(os.path.isfile(os.path.join(self.phone.holding(), ".nomedia")), msg="gallery apps do not show the moved files")
+
+    # "undo" puts every moved file back in its folder, with the same name, content and date, and removes GPTK-deleted.
+    def test_undo_puts_every_file_back(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        self.phone.add_whatsapp("WhatsApp Images/Sent/IMG-1.jpg", b"in google photos")
+        self.phone.add_whatsapp("WhatsApp Video/VID-1.mp4", b"video")
+        self.phone.add("DCIM/Camera/VID_1.mp4", b"video")
+        for path in self.phone.snapshot():
+            os.utime(path, (time.time() - 86400 * 100, time.time() - 86400 * 100))
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        before = self.phone.snapshot()
+        self.phone.run("clean", answers=["", "", "yes"])
+        self.assertEqual(len(self.phone.held_files()), 3, msg="test setup: clean moved 3 files")
+
+        code, asked = self.phone.run("undo", answers=[])
+
+        self.assertEqual(code, 0, msg="undo succeeds")
+        self.assertEqual(asked, [], msg="undo asks nothing, because it deletes nothing")
+        self.assertEqual(self.phone.snapshot(), before, msg="every file is back, with the same name, content and date")
+        self.assertFalse(os.path.exists(self.phone.holding()), msg="the empty GPTK-deleted folder is removed")
+
+    # "undo" never replaces a file: when a new file has the old name, the moved file stays in GPTK-deleted until the name is free.
+    def test_undo_never_replaces_a_file(self):
+        whatsapp = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        self.phone.run("clean")
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"new photo with the same name")
+
+        code, _ = self.phone.run("undo")
+
+        self.assertEqual(code, 3, msg="undo reports the file that it could not put back")
+        self.assertEqual(self.read(whatsapp), b"new photo with the same name", msg="the new file is not replaced")
+        self.assertEqual(self.phone.held_contents(), [b"in google photos"], msg="the moved file is still safe in GPTK-deleted")
+
+        os.remove(whatsapp)
+        code, _ = self.phone.run("undo")
+
+        self.assertEqual(code, 0, msg="undo succeeds when the name is free again")
+        self.assertEqual(self.read(whatsapp), b"in google photos", msg="the moved file is back")
+
+    # "undo" makes the folder of a moved file again when the folder was removed.
+    def test_undo_makes_a_removed_folder_again(self):
+        sent = self.phone.add_whatsapp("WhatsApp Images/Sent/IMG-1.jpg", b"in google photos")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        self.phone.run("clean")
+        os.rmdir(os.path.dirname(sent))
+
+        code, _ = self.phone.run("undo")
+
+        self.assertEqual(code, 0, msg="undo succeeds")
+        self.assertEqual(self.read(sent), b"in google photos", msg="the file is back in its folder")
+
+    # Without moved files, "undo" and "empty" do nothing and ask nothing.
+    def test_undo_and_empty_without_moved_files_do_nothing(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+        before = self.phone.snapshot()
+
+        for command in ("undo", "empty"):
+            with self.subTest(command=command):
+                code, asked = self.phone.run(command, answers=[])
+
+                self.assertEqual(code, 0, msg="there is simply nothing to do")
+                self.assertEqual(asked, [], msg="the user is not asked")
+                self.assertEqual(self.phone.snapshot(), before, msg="no file changes")
+
+    # "empty" deletes nothing without a clear "yes", also when the question is closed.
+    def test_empty_without_yes_deletes_nothing(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        self.phone.run("clean")
+        held = self.phone.held_files()
+
+        for answer in ("", "y", "no", "yes please", EOFError, KeyboardInterrupt):
+            with self.subTest(answer=str(answer)):
+
+                def ask(_prompt, answer=answer):
+                    if isinstance(answer, str):
+                        return answer
+                    raise answer()
+
+                code, _ = self.phone.run("empty", ask=ask)
+
+                self.assertEqual(code, 1, msg="empty reports that it was cancelled")
+                self.assertEqual(self.phone.held_files(), held, msg="the moved files are still in GPTK-deleted")
+
+    # "empty" with "yes" deletes the moved files for good, removes GPTK-deleted and touches no other file.
+    def test_empty_deletes_the_moved_files_for_good(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        self.phone.add_whatsapp("WhatsApp Video/VID-1.mp4", b"video")
+        self.phone.add("DCIM/Camera/VID_1.mp4", b"video")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        self.phone.run("clean", answers=["", "yes"])
+        rest = self.phone.snapshot()
+
+        code, asked = self.phone.run("empty", answers=["yes"])
+
+        self.assertEqual(code, 0, msg="empty succeeds")
+        self.assertEqual(len(asked), 1, msg="empty asks once")
+        self.assertFalse(os.path.exists(self.phone.holding()), msg="GPTK-deleted is gone, with the moved files")
+        self.assertEqual(self.phone.snapshot(), rest, msg="no other file on the phone is touched")
+
+    # "empty" keeps a moved file that Google Photos does not have when the copy that stayed on the phone changed or is gone. "undo" can still put it back.
+    def test_empty_keeps_a_file_whose_other_copy_is_gone(self):
+        for change in ("deleted", "edited"):
+            with self.subTest(change=change):
+                phone = self.fresh_phone()
+                whatsapp = phone.add_whatsapp("WhatsApp Video/VID-1.mp4", b"video")
+                camera = phone.add("DCIM/Camera/VID_1.mp4", b"video")
+                phone.run("copies", answers=["", "yes"])
+                if change == "deleted":
+                    os.remove(camera)
+                else:
+                    phone.add("DCIM/Camera/VID_1.mp4", b"edited video")
+
+                code, _ = phone.run("empty", answers=["yes"])
+
+                self.assertEqual(code, 0, msg="keeping a file for safety is not an error")
+                self.assertEqual(phone.held_contents(), [b"video"], msg="the last copy of the video is not deleted")
+                phone.run("undo")
+                self.assertEqual(self.read(whatsapp), b"video", msg="undo puts the last copy back")
+
+    # "empty" deletes a moved file that is in Google Photos also when its copy on the phone is gone, because Google Photos keeps it.
+    def test_empty_deletes_a_google_photos_file_when_its_phone_copy_is_gone(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+        camera = self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+        self.phone.write_result({fingerprint_of(b"photo"): "AF1QipPhoto"})
+        self.phone.run("clean", answers=["", "yes"])
+        os.remove(camera)
+
+        code, _ = self.phone.run("empty", answers=["yes"])
+
+        self.assertEqual(code, 0, msg="empty succeeds")
+        self.assertEqual(self.phone.held_files(), [], msg="the file that Google Photos has is deleted")
+
+    # "empty" keeps a file in GPTK-deleted that changed after it was moved.
+    def test_empty_keeps_a_moved_file_that_changed(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"first photo")
+        self.phone.add_whatsapp("WhatsApp Images/IMG-2.jpg", b"second photo")
+        self.phone.write_result({fingerprint_of(b"first photo"): "AF1QipFirst", fingerprint_of(b"second photo"): "AF1QipSecond"})
+        self.phone.run("clean")
+        batch, name, _ = next(item for item in self.phone.held_files() if item[2] == b"first photo")
+        with open(os.path.join(self.phone.holding(), batch, name), "wb") as handle:
+            handle.write(b"other photo")
+
+        code, _ = self.phone.run("empty", answers=["yes"])
+
+        self.assertEqual(code, 0, msg="keeping a file for safety is not an error")
+        self.assertEqual(self.phone.held_contents(), [b"other photo"], msg="only the unchanged file is deleted")
+
+    # Files in GPTK-deleted are never copies, so the copy that the user chose to keep is not offered again.
+    def test_moved_files_are_not_copies(self):
+        whatsapp = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo")
+        camera = self.phone.add("DCIM/Camera/IMG_1.jpg", b"photo")
+        self.phone.run("copies", answers=["1", "yes"])
+        self.assertTrue(os.path.exists(whatsapp) and not os.path.exists(camera), msg="test setup: the WhatsApp copy stays, the camera copy is moved")
+
+        code, asked = self.phone.run("copies", answers=[])
+
+        self.assertEqual(code, 0, msg="there is nothing to do")
+        self.assertEqual(asked, [], msg="the moved copy is not offered as a copy")
+        self.assertEqual(self.read(whatsapp), b"photo", msg="the copy that the user kept stays")
+
+    # The files in GPTK-deleted are never read, also when --folder names Download or a folder in GPTK-deleted.
+    def test_gptk_deleted_is_never_read(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        self.phone.run("clean")
+        held = self.phone.held_files()
+
+        code, _ = self.phone.run("scan", "--folder", "Download")
+
+        self.assertEqual(code, 0, msg="scan succeeds")
+        self.assertEqual(self.phone.fingerprints(), [], msg="the moved files are not read in Download")
+        for folder in ("Download/GPTK-deleted", "Download/gptk-deleted", f"Download/GPTK-deleted/{held[0][0]}"):
+            with self.subTest(folder=folder):
+                code, asked = self.phone.run("copies", "--folder", folder, answers=[])
+
+                self.assertEqual(code, 2, msg="a folder in GPTK-deleted is refused")
+                self.assertEqual(asked, [], msg="the user is not asked")
+        self.assertEqual(self.phone.held_files(), held, msg="the moved files are not touched")
+
+    # Two moves in the same second keep their files apart, and "undo" puts back the files of both.
+    def test_two_moves_in_the_same_second_are_both_undone(self):
+        first = self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"first photo")
+        frozen = dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+
+        class FrozenClock(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen.astimezone(tz) if tz is not None else frozen.replace(tzinfo=None)
+
+        with mock.patch.object(phone.dt, "datetime", FrozenClock):
+            self.phone.write_result({fingerprint_of(b"first photo"): "AF1QipFirst"})
+            self.phone.run("clean")
+            second = self.phone.add_whatsapp("WhatsApp Images/IMG-2.jpg", b"second photo")
+            self.phone.write_result({fingerprint_of(b"second photo"): "AF1QipSecond"})
+            self.phone.run("clean")
+        self.assertEqual(len(self.phone.batches()), 2, msg="each yes has its own folder in GPTK-deleted")
+
+        code, _ = self.phone.run("undo")
+
+        self.assertEqual(code, 0, msg="undo succeeds")
+        self.assertEqual((self.read(first), self.read(second)), (b"first photo", b"second photo"), msg="the files of both moves are back")
+
+    # Files with the same name from different folders are kept apart in GPTK-deleted, and "undo" puts each back in its own folder.
+    def test_files_with_the_same_name_are_kept_apart(self):
+        files = {
+            self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"photo A"): b"photo A",
+            self.phone.add_whatsapp("WhatsApp Images/Sent/IMG-1.jpg", b"photo B"): b"photo B",
+            self.phone.add_whatsapp("WhatsApp Images/Private/img-1.JPG", b"photo C"): b"photo C",
+            self.phone.add_whatsapp("WhatsApp Images/caf\u00e9.jpg", b"photo D"): b"photo D",
+            self.phone.add_whatsapp("WhatsApp Images/Sent/cafe\u0301.jpg", b"photo E"): b"photo E",
+        }
+        self.phone.write_result({fingerprint_of(content): f"AF1Qip{index}" for index, content in enumerate(files.values())})
+        self.phone.run("clean")
+
+        names = [name for _, name, _ in self.phone.held_files()]
+        same_name = [unicodedata.normalize("NFD", name).casefold() for name in names]
+        self.assertEqual(len(set(same_name)), len(files), msg="the names differ also on a phone that ignores upper and lower case and the form of letters")
+        code, _ = self.phone.run("undo")
+
+        self.assertEqual(code, 0, msg="undo succeeds")
+        self.assertEqual({path: self.read(path) for path in files}, files, msg="each file is back in its own folder")
+
+    # When the script stops while files move (Ctrl+C, or the phone closes Termux), "undo" still puts back every file that moved.
+    def test_undo_works_after_a_stop_while_files_move(self):
+        class PhoneStopped(BaseException):
+            """The phone stops the script at once, with no time to tidy up."""
+
+        for stop in (KeyboardInterrupt, PhoneStopped):
+            with self.subTest(stop=stop.__name__):
+                device = self.fresh_phone()
+                contents = [b"first photo", b"second photo", b"third photo"]
+                for index, content in enumerate(contents):
+                    device.add_whatsapp(f"WhatsApp Images/IMG-{index}.jpg", content)
+                device.write_result({fingerprint_of(content): f"AF1Qip{index}" for index, content in enumerate(contents)})
+                before = device.snapshot()
+                real_rename = os.rename
+                moves = []
+
+                # The second file moves, and then the stop comes at once.
+                def rename(source, target, stop=stop):
+                    moves.append(source)
+                    real_rename(source, target)
+                    if len(moves) == 2:
+                        raise stop()
+
+                with mock.patch.object(phone.os, "rename", side_effect=rename):
+                    try:
+                        device.run("clean")
+                    except PhoneStopped:
+                        pass
+                self.assertEqual(len(device.held_files()), 2, msg="test setup: two files moved before the stop")
+
+                code, _ = device.run("undo")
+
+                self.assertEqual(code, 0, msg="undo succeeds")
+                self.assertEqual(device.snapshot(), before, msg="every file that moved is back")
+
+    # A stop while the list of moved files is saved (Ctrl+C, or the phone ends Termux at once) loses nothing, and "undo" cleans up.
+    @unittest.skipUnless(hasattr(os, "fork"), "needs os.fork to stop the script at once")
+    def test_a_stop_while_the_list_is_saved_loses_nothing(self):
+        for save, stop in ((1, "at once"), (2, "at once"), (2, "Ctrl+C")):
+            with self.subTest(save=save, stop=stop):
+                device = self.fresh_phone()
+                device.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+                device.add_whatsapp("WhatsApp Video/VID-1.mp4", b"video")
+                device.add("DCIM/Camera/VID_1.mp4", b"video")
+                device.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+                before = device.snapshot()
+                real_replace = os.replace
+                saves = []
+
+                # The list is saved before the files move and again after. The stop comes during the chosen save.
+                def replace(source, target, save=save, stop=stop):
+                    saves.append(target)
+                    if len(saves) == save and stop == "Ctrl+C":
+                        raise KeyboardInterrupt()
+                    if len(saves) == save:
+                        os._exit(9)
+                    real_replace(source, target)
+
+                def clean(device=device, replace=replace):
+                    with mock.patch.object(phone.os, "replace", side_effect=replace):
+                        return device.run("clean", answers=["", "yes"])[0]
+
+                if stop == "Ctrl+C":
+                    try:
+                        code = clean()
+                    except KeyboardInterrupt:
+                        code = None
+                    self.assertEqual(code, 1, msg="clean ends normally and reports that it was stopped")
+                else:
+                    child = os.fork()
+                    if child == 0:
+                        try:
+                            clean()
+                        finally:
+                            os._exit(0)
+                    _, status = os.waitpid(child, 0)
+                    self.assertEqual(os.waitstatus_to_exitcode(status), 9, msg="test setup: the script stopped while it saved the list")
+
+                code, _ = device.run("undo")
+
+                self.assertEqual(code, 0, msg="undo succeeds")
+                self.assertEqual(device.snapshot(), before, msg="every file is back, unchanged")
+                self.assertFalse(os.path.exists(device.holding()), msg="nothing is left in GPTK-deleted")
+
+    # A short read error just after a file moves does not drop the file from the list, so "undo" still puts it back.
+    def test_a_read_error_after_a_move_does_not_lose_the_file(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        before = self.phone.snapshot()
+        real_lstat = os.lstat
+        errors = []
+
+        # The first look at a file in GPTK-deleted fails once, like a short storage error.
+        def lstat(path, *args, **kwargs):
+            info = real_lstat(path, *args, **kwargs)
+            if not errors and os.fspath(path).startswith(self.phone.holding()) and stat.S_ISREG(info.st_mode):
+                errors.append(path)
+                raise OSError(errno.EIO, "Input/output error")
+            return info
+
+        with mock.patch.object(phone.os, "lstat", side_effect=lstat):
+            self.phone.run("clean")
+        self.assertEqual(len(errors), 1, msg="test setup: one read error happened")
+
+        code, _ = self.phone.run("undo")
+
+        self.assertEqual(code, 0, msg="undo succeeds")
+        self.assertEqual(self.phone.snapshot(), before, msg="the moved file is back")
+
+    # A relative phone storage path (for example "storage/shared" in Termux) also works with "undo".
+    def test_undo_works_with_a_relative_storage_path(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        before = self.phone.snapshot()
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(os.path.dirname(self.phone.root))
+        relative = os.path.basename(self.phone.root)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            moved = phone.main(["clean", "--storage", relative], ask=lambda _prompt: "yes")
+            code = phone.main(["undo", "--storage", relative], ask=lambda _prompt: "")
+
+        self.assertEqual(moved, 0, msg="test setup: clean succeeds")
+        self.assertEqual(code, 0, msg="undo succeeds")
+        self.assertEqual(self.phone.snapshot(), before, msg="the moved file is back")
+
+    # When two moves name the same copy that stays, each time with another content, "empty" deletes only the moved file whose content that copy still has.
+    def test_empty_checks_the_copy_that_stays_for_each_content(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"first version")
+        saved = self.phone.add("Pictures/photo.jpg", b"first version")
+        self.phone.run("copies", answers=["", "yes"])
+        self.phone.add("Pictures/photo.jpg", b"second version")
+        self.phone.add_whatsapp("WhatsApp Images/IMG-2.jpg", b"second version")
+        self.phone.run("copies", answers=["", "yes"])
+        self.assertEqual(self.phone.held_contents(), [b"first version", b"second version"], msg="test setup: one file of each version moved")
+        self.phone.add("Pictures/photo.jpg", b"first version")
+
+        code, _ = self.phone.run("empty", answers=["yes"])
+
+        self.assertEqual(code, 0, msg="keeping files for safety is not an error")
+        self.assertEqual(self.phone.held_contents(), [b"second version"], msg="the second version stays, because no other copy of it is on the phone")
+        self.assertEqual(self.read(saved), b"first version", msg="the copy that stays is not touched")
+
+    # "empty" never trusts a file in GPTK-deleted as the copy that stays, also when a damaged list names one, because that copy can be deleted too.
+    def test_empty_never_counts_a_moved_file_as_the_copy_that_stays(self):
+        for named in ("itself", "itself through a link", "another moved copy"):
+            with self.subTest(named=named):
+                device = self.fresh_phone()
+                device.add_whatsapp("WhatsApp Video/VID-1.mp4", b"video")
+                device.add_whatsapp("WhatsApp Video/Sent/VID-1.mp4", b"video")
+                camera = device.add("DCIM/Camera/VID_1.mp4", b"video")
+                device.run("copies", answers=["", "yes"])
+                os.remove(camera)
+                (batch, first, _), (_, second, _) = device.held_files()
+                if named == "itself":
+                    kept = os.path.join(device.holding(), batch, first)
+                elif named == "itself through a link":
+                    os.symlink(os.path.join(device.holding(), batch), device.path("Pictures"))
+                    kept = os.path.join(device.path("Pictures"), first)
+                else:
+                    kept = os.path.join(device.holding(), batch, second)
+                list_path = os.path.join(device.holding(), batch, "moved-files.json")
+                with open(list_path, encoding="utf-8") as handle:
+                    content = json.load(handle)
+                for entry in content["files"]:
+                    if entry["name"] == first:
+                        entry["keptCopy"] = kept
+                with open(list_path, "w", encoding="utf-8") as handle:
+                    json.dump(content, handle)
+
+                code, _ = device.run("empty", answers=["yes"])
+
+                self.assertEqual(code, 0, msg="keeping files for safety is not an error")
+                self.assertEqual(device.held_contents(), [b"video", b"video"], msg="no moved copy is deleted, because no copy stays outside GPTK-deleted")
+
+    # When the list of moved files is damaged, "undo" and "empty" touch no file in that folder.
+    def test_a_damaged_list_leaves_the_files_alone(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"in google photos")
+        self.phone.write_result({fingerprint_of(b"in google photos"): "AF1QipBackedUp"})
+        self.phone.run("clean")
+        held = self.phone.held_files()
+        list_path = os.path.join(self.phone.holding(), held[0][0], "moved-files.json")
+        with open(list_path, encoding="utf-8") as handle:
+            good = json.load(handle)
+        damages = {
+            "not JSON": "{",
+            "another type": json.dumps(dict(good, type="fingerprints")),
+            "a name with a folder": json.dumps(dict(good, files=[dict(good["files"][0], name="../IMG-1.jpg")])),
+            "a place that is not a full path": json.dumps(dict(good, files=[dict(good["files"][0], **{"from": "IMG-1.jpg"})])),
+            "a bad fingerprint": json.dumps(dict(good, files=[dict(good["files"][0], hash="not a fingerprint")])),
+        }
+
+        for damage, text in damages.items():
+            with self.subTest(damage=damage):
+                with open(list_path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+
+                undo_code, _ = self.phone.run("undo")
+                empty_code, asked = self.phone.run("empty", answers=["yes"])
+
+                self.assertEqual((undo_code, empty_code), (2, 2), msg="undo and empty report the damaged list")
+                self.assertEqual(asked, [], msg="empty does not offer to delete files without a good list")
+                self.assertEqual(self.phone.held_files(), held, msg="the files in that folder are not touched")
+
+
+class RandomPhoneTests(PhoneTestCase):
+    """Many random phones, random answers and files that change meanwhile: no photo or video is ever lost."""
+
+    WHATSAPP_PLACES = (
+        f"{WHATSAPP_MEDIA}/WhatsApp Images",
+        f"{WHATSAPP_MEDIA}/WhatsApp Images/Sent",
+        f"{WHATSAPP_MEDIA}/WhatsApp Video",
+        "WhatsApp/Media/WhatsApp Images",
+    )
+    OTHER_PLACES = ("DCIM/Camera", "Pictures", "Pictures/Saved", "Download")
+    UNTOUCHABLE_PLACES = (
+        f"{WHATSAPP_MEDIA}/WhatsApp Stickers",
+        f"{WHATSAPP_MEDIA}/.Statuses",
+        "DCIM/.thumbnails",
+        "Pictures/Trash",
+        "Android/data/com.example.gallery/files",
+    )
+    NAMES = ("IMG-1.jpg", "img-1.JPG", "VID-1.mp4", "caf\u00e9.jpg", "cafe\u0301.jpg", "photo (2).jpg", ".hidden.jpg", "notes.txt")
+    # Two photos of the same size, so that a file with the same size is not always a copy.
+    CONTENTS = (b"photo A", b"photo B", b"video C" * 9, b"video D" * 9, b"photo E" * 3, b"")
+    ANSWERS = ("", "", "", "1", "1", "2", "2", "3", "all", " ALL ", "skip", "auto", "stop", "maybe")
+
+    def random_phone(self, rng) -> FakePhone:
+        phone = self.fresh_phone()
+        used = set()
+        places = self.WHATSAPP_PLACES + self.OTHER_PLACES + self.UNTOUCHABLE_PLACES
+        for index in range(rng.randint(6, 22)):
+            relative = f"{rng.choice(self.WHATSAPP_PLACES if index == 0 else places)}/{rng.choice(self.NAMES)}"
+            # On the phone, names that differ only in upper and lower case or in the form of a letter are one file.
+            key = unicodedata.normalize("NFD", relative).casefold()
+            if key not in used:
+                used.add(key)
+                path = phone.add(relative, rng.choice(self.CONTENTS))
+                moment = time.time() - rng.randint(0, 86400 * 400)
+                os.utime(path, (moment, moment))
+        return phone
+
+    def change_randomly(self, rng, phone) -> None:
+        """Edits, replaces or deletes a few files, as if the phone was used while the last question was open."""
+        paths = sorted(phone.snapshot())
+        for path in rng.sample(paths, min(len(paths), rng.choice((0, 0, 1, 2)))):
+            action = rng.choice(("edit", "replace", "delete"))
+            if action == "delete":
+                os.remove(path)
+            else:
+                with open(path, "wb") as handle:
+                    handle.write(b"edited" if action == "edit" else rng.choice(self.CONTENTS))
+
+    def run_randomly(self, rng, phone, command) -> dict:
+        """Runs the command with random answers, but never confirms deleting every copy of a file. Returns the phone just before the move."""
+        seen = {"before": phone.snapshot()}
+
+        def ask(prompt):
+            if "choice" in prompt.lower():
+                return rng.choice(self.ANSWERS)
+            if '"delete"' in prompt:
+                return ""
+            self.change_randomly(rng, phone)
+            seen["before"] = phone.snapshot()
+            return "yes"
+
+        code, _ = phone.run(command, ask=ask)
+        self.assertEqual(code, 0, msg="the command ends normally")
+        return seen["before"]
+
+    def check_move(self, phone, before, google) -> int:
+        """Checks the phone after the move. Returns the number of moved files."""
+        after = phone.snapshot()
+        held = {(batch, name): content for batch, name, content in phone.held_files()}
+        moved = sorted(set(before) - set(after))
+        self.assertLessEqual(set(after), set(before), msg="no new file appears outside GPTK-deleted")
+        self.assertEqual({path: before[path] for path in after}, after, msg="no file that stays is changed")
+        self.assertEqual(sorted(before[path][0] for path in moved), sorted(held.values()), msg="GPTK-deleted holds exactly the moved files, unchanged")
+        entries = phone.moved_list()
+        self.assertEqual(sorted(entry["from"] for entry in entries), moved, msg="the list names each moved file")
+        for entry in entries:
+            self.assertEqual(held[(entry["batch"], entry["name"])], before[entry["from"]][0], msg="the list knows where each moved file was")
+        for path in moved:
+            relative = os.path.relpath(path, phone.root)
+            self.assertIn(os.path.dirname(relative), self.WHATSAPP_PLACES + self.OTHER_PLACES, msg="files in hidden, trash, sticker and app folders never move")
+            self.assertFalse(os.path.basename(path).startswith(".") or path.endswith(".txt"), msg="only photos and videos that are not hidden move")
+        left = {content for content, _ in after.values()}
+        for content, _ in before.values():
+            self.assertTrue(content in left or fingerprint_of(content) in google, msg="each photo and video is still on the phone or in Google Photos")
+        return len(moved)
+
+    def check_empty(self, rng, phone, google) -> tuple:
+        """Deletes some files, then empties GPTK-deleted and checks the phone. Returns the numbers of deleted and kept files."""
+        entries = phone.moved_list()
+        for entry in entries:
+            if entry["keptCopy"] and os.path.exists(entry["keptCopy"]) and rng.random() < 0.5:
+                os.remove(entry["keptCopy"])
+        before = phone.snapshot()
+        held = phone.held_files()
+
+        code, _ = phone.run("empty", answers=["yes"])
+
+        after = phone.snapshot()
+        remaining = phone.held_files()
+        self.assertEqual(code, 0, msg="empty ends normally")
+        self.assertEqual(after, before, msg="empty touches no file outside GPTK-deleted")
+        everything = {content for content, _ in after.values()} | {content for _, _, content in remaining}
+        for content in [content for content, _ in before.values()] + [content for _, _, content in held]:
+            self.assertTrue(content in everything or fingerprint_of(content) in google, msg="empty never deletes the last copy of a file that Google Photos does not have")
+        for batch, name, content in remaining:
+            entry = next(entry for entry in entries if (entry["batch"], entry["name"]) == (batch, name))
+            other_copy = before.get(entry["keptCopy"])
+            self.assertIsNone(entry["googlePhotos"], msg="a file that Google Photos has is always deleted")
+            self.assertTrue(other_copy is None or other_copy[0] != content, msg="a file stays only when the copy that stayed on the phone is gone or changed")
+        return len(held) - len(remaining), len(remaining)
+
+    # Whatever the answers and changes, no photo or video is lost, "undo" puts everything back and "empty" keeps every last copy.
+    def test_random_phones_never_lose_a_photo(self):
+        totals = {"moved": 0, "deleted": 0, "kept": 0}
+        for seed in range(60):
+            with self.subTest(seed=seed):
+                rng = random.Random(seed)
+                phone = self.random_phone(rng)
+                command = "copies" if seed % 2 == 0 else "clean"
+                google = {}
+                if command == "clean":
+                    google = {fingerprint_of(content): f"AF1QipRandom{index}" for index, content in enumerate(self.CONTENTS) if rng.random() < 0.4}
+                    phone.write_result(google)
+
+                before = self.run_randomly(rng, phone, command)
+                totals["moved"] += self.check_move(phone, before, google)
+                code, _ = phone.run("undo", answers=[])
+
+                self.assertEqual(code, 0, msg="undo succeeds")
+                self.assertEqual(phone.snapshot(), before, msg="undo puts every file back as it was")
+                self.assertFalse(os.path.exists(phone.holding()), msg="GPTK-deleted is removed")
+
+                before = self.run_randomly(rng, phone, command)
+                totals["moved"] += self.check_move(phone, before, google)
+                deleted, kept = self.check_empty(rng, phone, google)
+                totals["deleted"] += deleted
+                totals["kept"] += kept
+        self.assertTrue(all(totals.values()), msg=f"the random phones moved, deleted and kept files: {totals}")
 
 
 if __name__ == "__main__":

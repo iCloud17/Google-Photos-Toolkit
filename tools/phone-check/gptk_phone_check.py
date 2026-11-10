@@ -13,7 +13,11 @@ Run it on the phone in Termux. It needs only Python and it sends nothing anywher
      Reads the newest Download/gptk-result.json. It also looks in the other
      folders of the phone for copies of the WhatsApp files. For each file that
      has more than one copy, it shows where the copies are and you choose what
-     to keep. It deletes nothing until you type "yes".
+     to keep. It deletes nothing until you type "yes". Then it moves the files
+     to Download/GPTK-deleted, where they still use space.
+  4. Check your photos and WhatsApp chats. Then:
+     python gptk_phone_check.py undo    puts all moved files back
+     python gptk_phone_check.py empty   deletes them for good (frees the space)
 
 "python gptk_phone_check.py copies" does only the search for copies, without
 Google Photos (steps 1 and 2 are then not necessary).
@@ -36,6 +40,7 @@ import stat
 import sys
 import tempfile
 import time
+import unicodedata
 from typing import Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 FORMAT = "gptk-phone-check"
@@ -52,9 +57,21 @@ DEFAULT_FOLDERS = (
     "WhatsApp/Media",
     "WhatsApp Business/Media",
 )
-SKIPPED_FOLDER_NAMES = {"whatsapp stickers"}
+# "yes" moves the files to this folder (in Download) instead of deleting them, so that "undo" can put them back.
+# "empty" deletes them for good. Every search skips folders with this name.
+HOLDING_FOLDER_NAME = "GPTK-deleted"
+MOVED_LIST_NAME = "moved-files.json"
+HOLDING_NOTE_NAME = "READ ME.txt"
+HOLDING_NOTE = """Phone Check (gptk_phone_check.py) moved these photos and videos here instead of deleting them.
+They still use space on the phone. Each folder holds the files of one "yes", and moved-files.json says where each file was.
+
+To put all the files back where they were, run in Termux:  python gptk_phone_check.py undo
+To delete them for good and free the space, run in Termux:  python gptk_phone_check.py empty
+"""
+SKIPPED_FOLDER_NAMES = {"whatsapp stickers", HOLDING_FOLDER_NAME.lower()}
 # Apps own the folders in Android/, and an app can delete its files at any time (cache cleanup or uninstall).
-# So a file there does not count as a copy, and these folders are not searched for copies.
+# So the search for copies in the other folders skips them. A copy in the WhatsApp (or --folder) folders still counts:
+# keep_order puts it last, and print_summary warns when the only copy that stays is in WhatsApp.
 APP_FOLDERS = ("Android",)
 # A file in a trash or recycle bin folder can disappear soon. These folders are skipped in every search,
 # so such a file never counts as a copy, and the script never deletes it.
@@ -87,11 +104,13 @@ REVIEW_HELP = (
     "  stop      to keep all copies of this one and all the next ones",
     "  (Enter)   to use the suggestion",
     'Nothing is deleted before you type "yes" at the end.',
+    f'Then the files go to the {HOLDING_FOLDER_NAME} folder, and "undo" can put them back.',
 )
 
 EXIT_OK = 0
 EXIT_CANCELLED = 1
 EXIT_INPUT_ERROR = 2
+# Some files could not be moved, put back or deleted.
 EXIT_DELETE_FAILED = 3
 
 
@@ -122,6 +141,29 @@ class Deletion(NamedTuple):
     media_key: Optional[str]
     # The copy that stays on the phone, or None when no copy stays.
     kept: Optional[MediaFile]
+
+
+class HeldFile(NamedTuple):
+    """A file that "yes" moved to the GPTK-deleted folder."""
+
+    # The file name in the batch folder.
+    name: str
+    # Where the file was. undo puts it back there.
+    origin: str
+    size: int
+    hash: str
+    google_link: Optional[str]
+    # The copy that stayed on the phone, or None when no copy stayed.
+    kept: Optional[str]
+
+
+class Batch(NamedTuple):
+    """The files that one "yes" moved: a folder in GPTK-deleted with the files and their list."""
+
+    folder: str
+    files: List[HeldFile]
+    # When the files were moved. None if the list does not say.
+    created: Optional[dt.datetime] = None
 
 
 class CheckResult(NamedTuple):
@@ -177,11 +219,22 @@ def is_inside(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
 
 
+def in_whatsapp_folder(path: str, storage: str) -> bool:
+    return any(is_inside(path, os.path.join(storage, folder)) for folder in DEFAULT_FOLDERS)
+
+
+def inside_holding_folder(path: str) -> bool:
+    return HOLDING_FOLDER_NAME.lower() in (part.lower() for part in os.path.normpath(path).split(os.sep))
+
+
 def resolve_folders(storage: str, requested: Optional[Sequence[str]]) -> List[str]:
     folders = []
     for folder in requested or DEFAULT_FOLDERS:
         path = os.path.normpath(os.path.join(storage, folder))
-        if os.path.isdir(path):
+        if inside_holding_folder(path):
+            # The files there were already moved. Reading them again could make them count as copies.
+            print(f"Skipped {shown(path)}: the files in {HOLDING_FOLDER_NAME} are never read.")
+        elif os.path.isdir(path):
             if path not in folders:
                 folders.append(path)
         elif requested:
@@ -286,6 +339,11 @@ def write_atomically(path: str, text: str) -> None:
     try:
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
             stream.write(text)
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except OSError:
+                pass
         os.replace(temp_path, path)
     except BaseException:
         if os.path.exists(temp_path):
@@ -491,7 +549,7 @@ def print_group(number: int, total: int, group: CopyGroup, suggestion: Choice, g
 
 def confirm_delete_all(google_checked: bool, ask: Callable[[str], str]) -> bool:
     print("  WARNING: " + ("GPTK did not confirm this file in your Google Photos." if google_checked else "Nobody checked if your Google Photos has this file."))
-    print("  If you delete all copies, the file is gone for good.")
+    print(f"  If you delete all copies, the file is gone for good when you empty {HOLDING_FOLDER_NAME}.")
     return ask('  Type "delete" to delete all copies, or press Enter to choose again: ').strip().lower() == "delete"
 
 
@@ -559,10 +617,13 @@ def print_summary(deletions: Sequence[Deletion], storage: str, list_files: bool)
     kinds = (
         ("In your Google Photos (the copies there stay)", [item.media for item in deletions if item.kept is None and item.media_key is not None]),
         ("Extra copies (1 copy of each file stays on this phone)", [item.media for item in deletions if item.kept is not None]),
-        ("All copies, NOT confirmed in Google Photos (gone for good)", [item.media for item in deletions if item.kept is None and item.media_key is None]),
+        (
+            f"All copies, NOT confirmed in Google Photos (gone for good when you empty {HOLDING_FOLDER_NAME})",
+            [item.media for item in deletions if item.kept is None and item.media_key is None],
+        ),
     )
     print()
-    print(f"Ready to delete {count_text(len(deletions), 'file')} ({format_size(sum(item.media.size for item in deletions))}):")
+    print(f"Ready to move {count_text(len(deletions), 'file')} ({format_size(sum(item.media.size for item in deletions))}) to {HOLDING_FOLDER_NAME}:")
     for label, files in kinds:
         if files:
             print(f"  {label}: {count_text(len(files), 'file')}, {format_size(sum(media.size for media in files))}")
@@ -571,7 +632,13 @@ def print_summary(deletions: Sequence[Deletion], storage: str, list_files: bool)
         for item in deletions:
             print("  " + shown(item.media.path))
     if any(not item.media.elsewhere for item in deletions):
-        print("In WhatsApp chats, deleted photos and videos will show as not available.")
+        print("In WhatsApp chats, the moved photos and videos will show as not available.")
+    only_in_whatsapp = {
+        item.hash for item in deletions if item.media_key is None and item.kept is not None and in_whatsapp_folder(item.kept.path, storage)
+    }
+    if only_in_whatsapp:
+        print(f"Note: {count_text(len(only_in_whatsapp), 'file')} not confirmed in Google Photos will have only 1 copy left, in WhatsApp.")
+        print("If you then delete the chat with its media, or uninstall WhatsApp, that copy is gone for good.")
 
 
 def unchanged_file(path: str, hash_value: str) -> Optional[os.stat_result]:
@@ -585,33 +652,222 @@ def unchanged_file(path: str, hash_value: str) -> Optional[os.stat_result]:
     return None
 
 
-def delete_files(deletions: Sequence[Deletion], downloads: str) -> int:
-    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    record_path = os.path.join(downloads, f"gptk-deleted-{stamp}.txt")
+def name_key(name: str) -> str:
+    # The phone storage sees no difference between upper and lower case, and between the Unicode forms of a letter.
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
+def holding_names(paths: Sequence[str]) -> List[str]:
+    """A different file name in the batch folder for each path."""
+    used: Set[str] = set()
+    names = []
+    for path in paths:
+        name = os.path.basename(path)
+        stem, extension = os.path.splitext(name)
+        number = 1
+        while name_key(name) in used:
+            number += 1
+            name = f"{stem} ({number}){extension}"
+            if len(os.fsencode(name)) > 255:
+                name = f"{number}{extension}"
+        used.add(name_key(name))
+        names.append(name)
+    return names
+
+
+def make_batch_folder(holding: str) -> str:
+    """Makes GPTK-deleted (hidden from gallery apps) and a new folder in it for the files of this run."""
+    os.makedirs(holding, exist_ok=True)
+    with open(os.path.join(holding, ".nomedia"), "a"):
+        pass
     try:
-        record = open(record_path, "x", encoding="utf-8", errors="backslashreplace")
+        with open(os.path.join(holding, HOLDING_NOTE_NAME), "x", encoding="utf-8") as note:
+            note.write(HOLDING_NOTE)
+    except FileExistsError:
+        pass
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    for number in range(1, 1000):
+        folder = os.path.join(holding, stamp if number == 1 else f"{stamp} ({number})")
+        try:
+            os.mkdir(folder)
+            return folder
+        except FileExistsError:
+            continue
+    raise FileExistsError(holding)
+
+
+def write_moved_list(folder: str, files: Sequence[HeldFile]) -> None:
+    content = {
+        "format": FORMAT,
+        "type": "moved",
+        "version": VERSION,
+        "created": utc_now().isoformat(timespec="seconds").replace("+00:00", "Z"),
+        "files": [
+            {"name": item.name, "from": item.origin, "size": item.size, "hash": item.hash, "googlePhotos": item.google_link, "keptCopy": item.kept}
+            for item in files
+        ],
+    }
+    # ensure_ascii keeps file names that are not valid UTF-8 exactly as they are.
+    write_atomically(os.path.join(folder, MOVED_LIST_NAME), json.dumps(content, indent=1, ensure_ascii=True) + "\n")
+
+
+def is_full_path(value: object) -> bool:
+    return isinstance(value, str) and os.path.isabs(value) and "\0" not in value
+
+
+def read_moved_list(folder: str) -> Optional[Batch]:
+    """The batch with the files in the list of a batch folder, or None when the list is missing or damaged."""
+    try:
+        with open(os.path.join(folder, MOVED_LIST_NAME), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("format") != FORMAT or data.get("type") != "moved":
+        return None
+    if type(data.get("version")) is not int or data.get("version") != VERSION or not isinstance(data.get("files"), list):
+        return None
+    files: List[HeldFile] = []
+    names: Set[str] = set()
+    for entry in data["files"]:
+        if not isinstance(entry, dict):
+            return None
+        name, origin, size, hash_value = entry.get("name"), entry.get("from"), entry.get("size"), entry.get("hash")
+        link, kept = entry.get("googlePhotos"), entry.get("keptCopy")
+        # Only a plain file name: the file is always inside the batch folder.
+        if not isinstance(name, str) or name in ("", ".", "..") or name != os.path.basename(name) or "\0" in name or name_key(name) in names:
+            return None
+        if not is_full_path(origin) or type(size) is not int or size < 0:
+            return None
+        if not isinstance(hash_value, str) or not SHA1_BASE64.fullmatch(hash_value):
+            return None
+        if link is not None and not (isinstance(link, str) and link.startswith(PHOTO_URL) and MEDIA_KEY.fullmatch(link[len(PHOTO_URL) :])):
+            return None
+        if kept is not None and not is_full_path(kept):
+            return None
+        names.add(name_key(name))
+        files.append(HeldFile(name, origin, size, hash_value, link, kept))
+    return Batch(folder, files, parse_time(data.get("created")))
+
+
+def is_temporary_file(name: str) -> bool:
+    """A file that write_atomically left behind when the script was stopped while it wrote."""
+    return name.startswith(".gptk-") and name.endswith(".tmp")
+
+
+def read_batches(holding: str) -> Tuple[List[Batch], List[str]]:
+    """The batch folders in GPTK-deleted (oldest first), and the folders with files but no readable list."""
+    batches: List[Batch] = []
+    damaged: List[str] = []
+    try:
+        with os.scandir(holding) as entries:
+            folders = sorted(entry.path for entry in entries if entry.is_dir(follow_symlinks=False))
+    except FileNotFoundError:
+        return [], []
     except OSError:
-        print(f"Could not write the list of deleted files to {shown(record_path)}. Nothing was deleted.")
+        return [], [holding]
+    for folder in folders:
+        batch = read_moved_list(folder)
+        if batch is not None:
+            batches.append(batch)
+            continue
+        try:
+            # With no list, nothing was moved (the list is saved first). A folder with only a half-written list is empty.
+            if all(is_temporary_file(name) for name in os.listdir(folder)):
+                batches.append(Batch(folder, []))
+            else:
+                damaged.append(folder)
+        except OSError:
+            damaged.append(folder)
+    return batches, damaged
+
+
+def held_path(batch: Batch, item: HeldFile) -> str:
+    return os.path.join(batch.folder, item.name)
+
+
+def still_held(batch: Batch, item: HeldFile) -> bool:
+    try:
+        return stat.S_ISREG(os.lstat(held_path(batch, item)).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        # The file can be there: keep it in the list, so that undo can put it back later.
+        return True
+
+
+def tidy_holding(holding: str, batches: Sequence[Batch]) -> None:
+    """Removes the batch folders that have no file left (only their list), then GPTK-deleted if nothing else is in it."""
+    for batch in batches:
+        try:
+            names = os.listdir(batch.folder)
+            if all(name == MOVED_LIST_NAME or is_temporary_file(name) for name in names):
+                # The list goes last: if this stops, the folder still has its list.
+                for name in sorted(names, key=lambda name: name == MOVED_LIST_NAME):
+                    os.remove(os.path.join(batch.folder, name))
+                os.rmdir(batch.folder)
+        except OSError:
+            pass
+    try:
+        if set(os.listdir(holding)) <= {".nomedia", HOLDING_NOTE_NAME}:
+            for name in os.listdir(holding):
+                os.remove(os.path.join(holding, name))
+            os.rmdir(holding)
+    except OSError:
+        pass
+
+
+def print_damaged(damaged: Sequence[str]) -> None:
+    for folder in damaged:
+        print(f"Could not read the list of moved files in {shown(folder)}. The files in that folder are not touched.")
+
+
+def move_to_holding(deletions: Sequence[Deletion], downloads: str) -> int:
+    """Moves the files to a new folder in GPTK-deleted. Each file is checked again just before it moves."""
+    holding = os.path.join(downloads, HOLDING_FOLDER_NAME)
+    try:
+        folder = make_batch_folder(holding)
+    except OSError:
+        print(f"Could not make the folder {shown(holding)}. Nothing was deleted.")
+        return EXIT_INPUT_ERROR
+    names = holding_names([item.media.path for item in deletions])
+    planned = [
+        HeldFile(
+            name,
+            item.media.path,
+            item.media.size,
+            item.hash,
+            PHOTO_URL + item.media_key if item.media_key is not None else None,
+            item.kept.path if item.kept is not None else None,
+        )
+        for item, name in zip(deletions, names)
+    ]
+    try:
+        # The list is saved before any file moves, so that undo can always put every file back.
+        write_moved_list(folder, planned)
+    except OSError:
+        tidy_holding(holding, [Batch(folder, [])])
+        print(f"Could not write the list of files in {shown(folder)}. Nothing was deleted.")
         return EXIT_INPUT_ERROR
 
-    deleted_count, deleted_size, changed, no_kept_copy, failed = 0, 0, 0, 0, 0
-    kept_files: Dict[str, Optional[os.stat_result]] = {}
-    with record:
-        record.write("# Files deleted by gptk_phone_check.py.\n")
-        record.write("# path<TAB>size in bytes<TAB>Google Photos link (if Google Photos has the file)<TAB>copy that stays on the phone (if one stays)\n")
-        for item in deletions:
+    changed, no_kept_copy, failed = 0, 0, 0
+    stopped = False
+    kept_files: Dict[Tuple[str, str], Optional[os.stat_result]] = {}
+    try:
+        for item, held in zip(deletions, planned):
             kept_info = None
             if item.kept is not None:
                 # The copy that stays must still be there, unchanged. If not, keep this copy.
-                if item.kept.path not in kept_files:
-                    kept_files[item.kept.path] = unchanged_file(item.kept.path, item.hash)
-                kept_info = kept_files[item.kept.path]
+                key = (item.kept.path, item.hash)
+                if key not in kept_files:
+                    kept_files[key] = unchanged_file(item.kept.path, item.hash)
+                kept_info = kept_files[key]
                 if kept_info is None:
                     no_kept_copy += 1
                     continue
+            target = os.path.join(folder, held.name)
             try:
                 info = os.lstat(item.media.path)
-                # Check again just before deleting: the file must still be the same real file, and not the copy that stays.
+                # Check again just before moving: the file must still be the same real file, and not the copy that stays.
                 if (
                     not stat.S_ISREG(info.st_mode)
                     or (kept_info is not None and os.path.samestat(info, kept_info))
@@ -619,30 +875,54 @@ def delete_files(deletions: Sequence[Deletion], downloads: str) -> int:
                 ):
                     changed += 1
                     continue
-                os.remove(item.media.path)
+                # Never replace a file.
+                if os.path.lexists(target):
+                    failed += 1
+                    continue
+                os.rename(item.media.path, target)
             except FileNotFoundError:
                 changed += 1
                 continue
             except OSError:
                 failed += 1
                 continue
-            deleted_count += 1
-            deleted_size += item.media.size
-            link = PHOTO_URL + item.media_key if item.media_key is not None else ""
-            kept_path = item.kept.path if item.kept is not None else ""
-            record.write(f"{item.media.path}\t{item.media.size}\t{link}\t{kept_path}\n")
-            record.flush()
+    except KeyboardInterrupt:
+        stopped = True
 
-    print(f"Deleted {count_text(deleted_count, 'file')} ({format_size(deleted_size)}).")
-    print(f"The list of deleted files is in {shown(record_path)}")
+    # The list names the files that are really in the folder now, also when Ctrl+C came just after a move.
+    def files_in_folder() -> List[HeldFile]:
+        return [held for held in planned if still_held(Batch(folder, planned), held)]
+
+    try:
+        held_now = files_in_folder()
+        try:
+            write_moved_list(folder, held_now)
+        except OSError:
+            pass  # The first list names every moved file too.
+        tidy_holding(holding, [Batch(folder, held_now)])
+    except KeyboardInterrupt:
+        # The saved list (the first one, or the new one) still names every moved file.
+        stopped = True
+        held_now = files_in_folder()
+
+    if stopped:
+        print()
+        print("Stopped. The other files were not moved.")
+    if held_now:
+        print(f"Moved {count_text(len(held_now), 'file')} ({format_size(sum(item.size for item in held_now))}) to {shown(folder)}")
+        print("They still use space on the phone. First check your photos and WhatsApp chats. Then:")
+        print("  To put the files back, run: python gptk_phone_check.py undo")
+        print("  To delete them for good and free the space, run: python gptk_phone_check.py empty")
+    else:
+        print("No file was moved.")
     if changed:
         print(f"Kept {count_text(changed, 'file')} that changed or moved after the check.")
     if no_kept_copy:
         print(f"Kept {count_text(no_kept_copy, 'file')}, because the copy that was to stay on the phone changed or moved.")
     if failed:
-        print(f'Could not delete {count_text(failed, "file")}. Give Termux the "All files access" permission and run the command again.')
+        print(f'Could not move {count_text(failed, "file")}. Give Termux the "All files access" permission and run the command again.')
         return EXIT_DELETE_FAILED
-    return EXIT_OK
+    return EXIT_CANCELLED if stopped else EXIT_OK
 
 
 def find_and_delete(args: argparse.Namespace, ask: Callable[[str], str], downloads: str, found: Dict[str, str], google_checked: bool) -> int:
@@ -681,13 +961,13 @@ def find_and_delete(args: argparse.Namespace, ask: Callable[[str], str], downloa
 
     print_summary(deletions, args.storage, args.list)
     try:
-        answer = ask(f"Type yes to delete {count_text(len(deletions), 'file')}: ")
+        answer = ask(f"Type yes to move {count_text(len(deletions), 'file')} to {HOLDING_FOLDER_NAME}: ")
     except (EOFError, KeyboardInterrupt):
         answer = ""
     if answer.strip().lower() != "yes":
         print("Nothing was deleted.")
         return EXIT_CANCELLED
-    return delete_files(deletions, downloads)
+    return move_to_holding(deletions, downloads)
 
 
 def command_clean(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
@@ -726,6 +1006,124 @@ def command_copies(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
     return find_and_delete(args, ask, downloads, {}, google_checked=False)
 
 
+def command_undo(args: argparse.Namespace) -> int:
+    holding = os.path.join(args.downloads or os.path.join(args.storage, "Download"), HOLDING_FOLDER_NAME)
+    batches, damaged = read_batches(holding)
+    print_damaged(damaged)
+    # The newest first: if two moved files come from the same place, the newest goes back.
+    held = [(batch, item) for batch in reversed(batches) for item in batch.files if still_held(batch, item)]
+    if not held:
+        tidy_holding(holding, batches)
+        print(f"Nothing to put back: {shown(holding)} has no files from Phone Check.")
+        return EXIT_INPUT_ERROR if damaged else EXIT_OK
+
+    restored, restored_size, occupied, failed = 0, 0, 0, 0
+    for batch, item in held:
+        try:
+            # Never replace a file: when the old place has a file again, the moved file stays in GPTK-deleted.
+            if os.path.lexists(item.origin):
+                occupied += 1
+                continue
+            os.makedirs(os.path.dirname(item.origin), exist_ok=True)
+            os.rename(held_path(batch, item), item.origin)
+        except OSError:
+            failed += 1
+            continue
+        restored += 1
+        restored_size += item.size
+    tidy_holding(holding, batches)
+
+    print(f"Put back {count_text(restored, 'file')} ({format_size(restored_size)}) where they were.")
+    if occupied:
+        print(f"Did not put back {count_text(occupied, 'file')}, because another file now has the same name in the same folder.")
+        print(f"They are still in {shown(holding)}.")
+    if failed:
+        print(f'Could not put back {count_text(failed, "file")}. They are still in {shown(holding)}.')
+        print('Give Termux the "All files access" permission and run the command again.')
+    if occupied or failed:
+        return EXIT_DELETE_FAILED
+    return EXIT_INPUT_ERROR if damaged else EXIT_OK
+
+
+def command_empty(args: argparse.Namespace, ask: Callable[[str], str]) -> int:
+    holding = os.path.join(args.downloads or os.path.join(args.storage, "Download"), HOLDING_FOLDER_NAME)
+    batches, damaged = read_batches(holding)
+    print_damaged(damaged)
+    held = [(batch, item) for batch in batches for item in batch.files if still_held(batch, item)]
+    if not held:
+        tidy_holding(holding, batches)
+        print(f"Nothing to delete: {shown(holding)} has no files from Phone Check.")
+        return EXIT_INPUT_ERROR if damaged else EXIT_OK
+
+    print(f"{shown(holding)} has {count_text(len(held), 'file')} ({format_size(sum(item.size for _, item in held))}) from Phone Check:")
+    for batch in batches:
+        items = [item for owner, item in held if owner is batch]
+        if items:
+            print(f"  Moved {shown(os.path.basename(batch.folder))}: {count_text(len(items), 'file')}, {format_size(sum(item.size for item in items))}")
+    now = utc_now()
+    checked_long_ago = [
+        item for batch, item in held if item.google_link is not None and (batch.created is None or now - batch.created > MAX_RESULT_AGE)
+    ]
+    if checked_long_ago:
+        print(f"Note: the Google Photos check of {count_text(len(checked_long_ago), 'file')} is more than {MAX_RESULT_AGE.days} days old.")
+        print("If you deleted photos or videos in Google Photos since then, type no, then run undo.")
+    try:
+        answer = ask(f"Type yes to delete {count_text(len(held), 'file')} for good: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip().lower() != "yes":
+        print("Nothing was deleted.")
+        return EXIT_CANCELLED
+
+    deleted, deleted_size, changed, no_kept_copy, failed = 0, 0, 0, 0, 0
+    kept_files: Dict[Tuple[str, str], Optional[os.stat_result]] = {}
+    for batch, item in held:
+        kept_info = None
+        # A file that Google Photos does not have is deleted only while the copy that stayed on the phone is still there.
+        if item.google_link is None and item.kept is not None:
+            # Two moves can name the same copy that stays, each time with other contents: check each content.
+            key = (item.kept, item.hash)
+            if key not in kept_files:
+                # A copy in GPTK-deleted is never the copy that stays: it can be deleted with this file.
+                kept_files[key] = None if inside_holding_folder(item.kept) else unchanged_file(item.kept, item.hash)
+            kept_info = kept_files[key]
+            if kept_info is None:
+                no_kept_copy += 1
+                continue
+        path = held_path(batch, item)
+        try:
+            info = os.lstat(path)
+            # Delete only the file that was moved: the same size and fingerprint, and not the copy that stayed.
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_size != item.size
+                or (kept_info is not None and os.path.samestat(info, kept_info))
+                or fingerprint(path) != item.hash
+            ):
+                changed += 1
+                continue
+            os.remove(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            failed += 1
+            continue
+        deleted += 1
+        deleted_size += item.size
+    tidy_holding(holding, batches)
+
+    print(f"Deleted {count_text(deleted, 'file')} for good ({format_size(deleted_size)} of space is free now).")
+    if no_kept_copy:
+        print(f"Kept {count_text(no_kept_copy, 'file')} that Google Photos does not have, because the copy that stayed on the phone changed or is gone.")
+        print("To put them back where they were, run: python gptk_phone_check.py undo")
+    if changed:
+        print(f"Kept {count_text(changed, 'file')} that changed after they were moved.")
+    if failed:
+        print(f'Could not delete {count_text(failed, "file")}. Give Termux the "All files access" permission and run the command again.')
+        return EXIT_DELETE_FAILED
+    return EXIT_INPUT_ERROR if damaged else EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -738,7 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("GPTK_PHONE_STORAGE", DEFAULT_STORAGE),
         help=f"phone storage folder (default: {DEFAULT_STORAGE})",
     )
-    common.add_argument("--downloads", help="folder for the fingerprint, result and record files (default: STORAGE/Download)")
+    common.add_argument("--downloads", help="folder for the fingerprint and result files and GPTK-deleted (default: STORAGE/Download)")
     deleting = argparse.ArgumentParser(add_help=False)
     deleting.add_argument("--list", action="store_true", help="show every file before the last question")
 
@@ -751,17 +1149,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clean.add_argument("--result", help="result file to use (default: the newest gptk-result*.json in Download)")
     commands.add_parser("copies", parents=[common, deleting], help="only find copies on the phone and choose what to keep (no Google Photos)")
+    commands.add_parser("undo", parents=[common], help=f"put the files in {HOLDING_FOLDER_NAME} back where they were")
+    commands.add_parser("empty", parents=[common], help=f"delete the files in {HOLDING_FOLDER_NAME} for good, to free the space")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None, ask: Callable[[str], str] = input) -> int:
     args = build_parser().parse_args(argv)
+    # Full paths, so that the list of moved files always names full paths that undo accepts.
+    args.storage = os.path.abspath(os.path.expanduser(args.storage))
+    if args.downloads:
+        args.downloads = os.path.abspath(os.path.expanduser(args.downloads))
     if args.command == "scan":
         return command_scan(args)
     if args.command == "copies":
         return command_copies(args, ask)
+    if args.command == "undo":
+        return command_undo(args)
+    if args.command == "empty":
+        return command_empty(args, ask)
     return command_clean(args, ask)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        print("Stopped.")
+        sys.exit(EXIT_CANCELLED)
