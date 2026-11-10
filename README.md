@@ -53,7 +53,7 @@ Safety and privacy:
 You need, on the phone: Firefox with Violentmonkey (or Tampermonkey) and GPTK, and [Termux](https://termux.dev) from F-Droid or GitHub.
 
 1. In Termux, run `termux-setup-storage` and allow file access ("All files access" on Android 11 and later).
-2. Run `pkg install python curl`. Then download the script: `curl -L -o gptk_phone_check.py https://raw.githubusercontent.com/iCloud17/Google-Photos-Toolkit/main/tools/phone-check/gptk_phone_check.py`
+2. Run `pkg upgrade`, then `pkg install python curl`. Termux packages must all be upgraded together: if `curl` stops with "CANNOT LINK EXECUTABLE", run `apt update && apt full-upgrade`, then try again. Then download the script: `curl -L -o gptk_phone_check.py https://raw.githubusercontent.com/iCloud17/Google-Photos-Toolkit/main/tools/phone-check/gptk_phone_check.py`
 3. Run `python gptk_phone_check.py scan`. It writes `Download/gptk-fingerprints.json`.
 4. In Firefox, open photos.google.com, open GPTK, then open `Phone Check`. Choose `gptk-fingerprints.json`, tap `Check`, then tap `Download Result`. Always download the result, also when nothing is found, so that it replaces any older result.
 5. In Termux, run `python gptk_phone_check.py clean`. The result file is valid for 2 days, and only for the last scan. If you scan again, check the new `gptk-fingerprints.json` in GPTK again.
