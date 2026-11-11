@@ -267,6 +267,18 @@
         <fieldset class="sort-by-size"><label class="form-control checkbox-control"><input name="sortBySize" value="true" type="checkbox"><span>Sort by size</span></label></fieldset>
       </form>
 
+      <form class="phone-check-form">
+        <details class="phone-check"><summary>Phone Check</summary><fieldset>
+          <span class="filter-note">Find phone files that are already in your Google Photos. On the phone, make <b>gptk-fingerprints.json</b> with the phone script (scan). Choose that file here, then tap Check. Google gets only fingerprints, not your files. This check changes nothing in Google Photos.</span>
+          <div class="input-wrapper"><input id="phoneCheckFile" type="file"></div>
+          <div class="settings-controls">
+            <button type="button" id="phoneCheckRun" class="btn-primary">Check</button>
+            <button type="button" id="phoneCheckDownload" disabled>Download Result</button>
+          </div>
+          <div id="phoneCheckSummary" class="filter-note" aria-live="polite"></div>
+        </fieldset></details>
+      </form>
+
       <form class="settings-form">
         <details class="settings"><summary>Advanced Settings</summary><fieldset>
           <legend>Max Concurrent Per-Item Requests</legend><div class="input-wrapper"><input name="maxConcurrentSingleApiReq" value="30" min="1" type="number" required></div>
