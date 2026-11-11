@@ -250,14 +250,62 @@ class ScanTests(PhoneTestCase):
         self.assertEqual(code, 2, msg="scan reports that it found no folder")
         self.assertFalse(os.path.exists(self.phone.fingerprint_file()), msg="no fingerprint file is written")
 
-    # With --folder, only that folder is scanned.
+    # With --folder, only that folder is scanned. The folder can be relative to the phone storage or a full path.
     def test_scan_uses_only_the_chosen_folder(self):
-        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"whatsapp photo")
-        self.phone.add("DCIM/Test/photo.jpg", b"test photo")
+        for chosen in ("relative path", "full path"):
+            with self.subTest(chosen=chosen):
+                phone = self.fresh_phone()
+                phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"whatsapp photo")
+                phone.add("DCIM/Test/photo.jpg", b"test photo")
 
-        self.phone.run("scan", "--folder", "DCIM/Test")
+                phone.run("scan", "--folder", phone.path("DCIM/Test") if chosen == "full path" else "DCIM/Test")
 
-        self.assertEqual(self.phone.fingerprints(), [fingerprint_of(b"test photo")], msg="only the chosen folder is read")
+                self.assertEqual(phone.fingerprints(), [fingerprint_of(b"test photo")], msg="only the chosen folder is read")
+
+    # Without --folder, every folder with "WhatsApp" in its name is scanned, wherever it is in the phone storage, and no other folder.
+    def test_scan_reads_every_whatsapp_folder(self):
+        inside = {
+            f"{WHATSAPP_MEDIA}/WhatsApp Images/IMG-1.jpg": b"folder that WhatsApp uses",
+            "Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Video/VID-1.mp4": b"WhatsApp Business",
+            "WhatsApp/Media/WhatsApp Images/IMG-2.jpg": b"old WhatsApp folder",
+            "storage-0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video/VID-2.mp4": b"copy from an old phone",
+            "Pictures/whatsapp saved/photo.jpg": b"own folder",
+        }
+        for relative, data in inside.items():
+            self.phone.add(relative, data)
+        self.phone.add("DCIM/Camera/IMG_3.jpg", b"camera photo")
+        self.phone.add("Android/media/org.telegram.messenger/Telegram/IMG-4.jpg", b"other app")
+
+        code, _ = self.phone.run("scan")
+
+        self.assertEqual(code, 0, msg="scan succeeds")
+        self.assertEqual(
+            sorted(self.phone.fingerprints()),
+            sorted(fingerprint_of(data) for data in inside.values()),
+            msg="the files in all WhatsApp folders are read, and no other files",
+        )
+
+    # The search for WhatsApp folders skips hidden, trash, sticker, GPTK-deleted and private app folders, and does not follow links.
+    def test_scan_skips_whatsapp_folders_it_must_not_touch(self):
+        self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", b"normal photo")
+        for place in (
+            "DCIM/.hidden/WhatsApp/IMG-2.jpg",
+            "Pictures/Trash/WhatsApp/IMG-3.jpg",
+            "WhatsApp Stickers/sticker.webp",
+            "Download/GPTK-deleted/WhatsApp/IMG-4.jpg",
+            "Android/data/com.whatsapp/files/IMG-5.jpg",
+            "Android/obb/com.whatsapp/IMG-6.jpg",
+        ):
+            self.phone.add(place, place.encode())
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        with open(os.path.join(outside.name, "IMG-7.jpg"), "wb") as handle:
+            handle.write(b"outside the phone storage")
+        os.symlink(outside.name, self.phone.path("WhatsApp link"))
+
+        self.phone.run("scan")
+
+        self.assertEqual(self.phone.fingerprints(), [fingerprint_of(b"normal photo")], msg="only the photo in the WhatsApp folder is read")
 
     # A chosen folder that does not exist is an error, not a silent switch to other folders.
     def test_scan_with_a_missing_chosen_folder_fails(self):
@@ -284,6 +332,23 @@ class CleanTests(PhoneTestCase):
         self.assertFalse(os.path.exists(backed_up), msg="the backed-up file is deleted")
         self.assertFalse(os.path.exists(backed_up_copy), msg="its copy is deleted too")
         self.assertTrue(os.path.exists(phone_only), msg="a file that is not in Google Photos is kept")
+
+    # Clean deletes the files that are in Google Photos from every WhatsApp folder, and leaves the other folders alone.
+    def test_clean_uses_every_whatsapp_folder(self):
+        contents = (b"photo 1", b"video 2", b"photo 3", b"photo 4")
+        whatsapp = [
+            self.phone.add_whatsapp("WhatsApp Images/IMG-1.jpg", contents[0]),
+            self.phone.add("storage-0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video/VID-2.mp4", contents[1]),
+            self.phone.add("WhatsApp/Media/WhatsApp Images/IMG-3.jpg", contents[2]),
+        ]
+        camera = self.phone.add("DCIM/Camera/IMG_4.jpg", contents[3])
+        self.phone.write_result({fingerprint_of(data): f"AF1QipItem{index}" for index, data in enumerate(contents)})
+
+        code, _ = self.phone.run("clean", answers=["yes"])
+
+        self.assertEqual(code, 0, msg="clean succeeds")
+        self.assertFalse(any(os.path.exists(path) for path in whatsapp), msg="the files in all WhatsApp folders are deleted")
+        self.assertTrue(os.path.exists(camera), msg="the camera photo stays, because only WhatsApp folders are cleaned")
 
     # Any answer other than "yes" deletes nothing.
     def test_clean_keeps_everything_without_yes(self):
@@ -532,6 +597,61 @@ class CopyTests(PhoneTestCase):
         self.assertEqual(code, 0, msg="copies succeeds")
         self.assertFalse(os.path.exists(whatsapp), msg="the older WhatsApp copy is deleted")
         self.assertTrue(os.path.exists(pictures), msg="the copy outside WhatsApp stays on the phone")
+
+    # When all copies are in WhatsApp folders, the suggestion keeps the copy in the folder that WhatsApp uses, so that the chat still shows it.
+    def test_suggestion_keeps_the_copy_that_whatsapp_uses(self):
+        cases = (
+            (f"{WHATSAPP_MEDIA}/WhatsApp Video/VID-1.mp4", "storage-0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video/VID-1.mp4"),
+            (f"{WHATSAPP_MEDIA}/WhatsApp Video/VID-1.mp4", "WhatsApp/Media/WhatsApp Video/VID-1.mp4"),
+            (f"{WHATSAPP_MEDIA}/WhatsApp Video/VID-1.mp4", "Pictures/WhatsApp/VID-1.mp4"),
+            ("Android/media/com.whatsapp.w4b/WhatsApp Business/Media/WhatsApp Video/VID-1.mp4", "WhatsApp Business/Media/WhatsApp Video/VID-1.mp4"),
+        )
+        for used_place, other_place in cases:
+            with self.subTest(other=other_place):
+                phone = self.fresh_phone()
+                used = phone.add(used_place, b"video")
+                other = phone.add(other_place, b"video")
+                past = time.time() - 86400 * 365
+                os.utime(other, (past, past))
+
+                code, _ = phone.run("copies", answers=["", "yes"])
+
+                self.assertEqual(code, 0, msg="copies succeeds")
+                self.assertTrue(os.path.exists(used), msg="the copy that WhatsApp uses stays, also when the other copy is older")
+                self.assertFalse(os.path.exists(other), msg="the copy in the other WhatsApp folder is moved")
+
+    # A WhatsApp folder inside the folder of another app (Android/media/...) is not the folder that WhatsApp uses.
+    # That app can delete its files at any time, so the suggestion keeps the copy outside app folders.
+    def test_suggestion_does_not_prefer_another_apps_whatsapp_folder(self):
+        other_app = self.phone.add("Android/media/com.example.statussaver/WhatsApp/VID-1.mp4", b"video")
+        old_folder = self.phone.add("WhatsApp/Media/WhatsApp Video/VID-1.mp4", b"video")
+        past = time.time() - 86400 * 365
+        os.utime(other_app, (past, past))
+
+        code, _ = self.phone.run("copies", answers=["", "yes"])
+
+        self.assertEqual(code, 0, msg="copies succeeds")
+        self.assertTrue(os.path.exists(old_folder), msg="the copy outside app folders stays, also when the other copy is older")
+        self.assertFalse(os.path.exists(other_app), msg="the copy in the folder of the other app is moved")
+
+    # A chosen folder given through a link to the phone storage (like /sdcard/...) is the same folder as in the storage.
+    def test_chosen_folder_through_a_link_to_the_storage(self):
+        used = self.phone.add("Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video/VID-1.mp4", b"video")
+        other = self.phone.add("storage-0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video/VID-1.mp4", b"video")
+        past = time.time() - 86400 * 365
+        os.utime(other, (past, past))
+        links = tempfile.TemporaryDirectory()
+        self.addCleanup(links.cleanup)
+        sdcard = os.path.join(links.name, "sdcard")
+        os.symlink(self.phone.root, sdcard)
+
+        code, _ = self.phone.run(
+            "copies", "--folder", os.path.join(sdcard, "Android/media/com.whatsapp"), "--folder", "storage-0", answers=["", "yes"]
+        )
+
+        self.assertEqual(code, 0, msg="copies succeeds")
+        self.assertTrue(os.path.exists(used), msg="the copy that WhatsApp uses stays, also when it was chosen through a link")
+        self.assertFalse(os.path.exists(other), msg="the copy in the other WhatsApp folder is moved")
 
     # The suggestion keeps a copy in a gallery folder rather than one in Download, which is often emptied.
     def test_suggestion_prefers_a_gallery_folder_to_download(self):
@@ -1325,14 +1445,18 @@ class RandomPhoneTests(PhoneTestCase):
         f"{WHATSAPP_MEDIA}/WhatsApp Images/Sent",
         f"{WHATSAPP_MEDIA}/WhatsApp Video",
         "WhatsApp/Media/WhatsApp Images",
+        "storage-0/Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video",
+        "Pictures/WhatsApp",
     )
     OTHER_PLACES = ("DCIM/Camera", "Pictures", "Pictures/Saved", "Download")
     UNTOUCHABLE_PLACES = (
         f"{WHATSAPP_MEDIA}/WhatsApp Stickers",
         f"{WHATSAPP_MEDIA}/.Statuses",
         "DCIM/.thumbnails",
+        "DCIM/.hidden/WhatsApp",
         "Pictures/Trash",
         "Android/data/com.example.gallery/files",
+        "Android/data/com.whatsapp/files",
     )
     NAMES = ("IMG-1.jpg", "img-1.JPG", "VID-1.mp4", "caf\u00e9.jpg", "cafe\u0301.jpg", "photo (2).jpg", ".hidden.jpg", "notes.txt")
     # Two photos of the same size, so that a file with the same size is not always a copy.

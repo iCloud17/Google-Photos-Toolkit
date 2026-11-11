@@ -5,8 +5,9 @@ that are already in your Google Photos, and extra copies of them on the phone.
 Run it on the phone in Termux. It needs only Python and it sends nothing anywhere.
 
   1. python gptk_phone_check.py scan
-     Reads the photos and videos in your WhatsApp folders and writes
-     Download/gptk-fingerprints.json (fingerprints only, no file names).
+     Finds every folder with "WhatsApp" in its name in the phone storage, reads
+     the photos and videos in them and writes Download/gptk-fingerprints.json
+     (fingerprints only, no file names).
   2. In Firefox, open photos.google.com > GPTK > Phone Check. Choose the
      fingerprint file, tap Check, then tap Download Result.
   3. python gptk_phone_check.py clean
@@ -51,12 +52,9 @@ RESULT_FILE_NAME = re.compile(r"gptk-result.*\.json", re.IGNORECASE)
 MAX_RESULT_AGE = dt.timedelta(days=2)
 
 DEFAULT_STORAGE = "/storage/emulated/0"
-DEFAULT_FOLDERS = (
-    "Android/media/com.whatsapp/WhatsApp/Media",
-    "Android/media/com.whatsapp.w4b/WhatsApp Business/Media",
-    "WhatsApp/Media",
-    "WhatsApp Business/Media",
-)
+# Without --folder, the script checks every folder with this text in its name, anywhere in the phone storage:
+# Android/media/com.whatsapp (the folder that WhatsApp uses), the old WhatsApp folder, a copy from an old phone, and so on.
+WHATSAPP_NAME = "whatsapp"
 # "yes" moves the files to this folder (in Download) instead of deleting them, so that "undo" can put them back.
 # "empty" deletes them for good. Every search skips folders with this name.
 HOLDING_FOLDER_NAME = "GPTK-deleted"
@@ -70,9 +68,11 @@ To delete them for good and free the space, run in Termux:  python gptk_phone_ch
 """
 SKIPPED_FOLDER_NAMES = {"whatsapp stickers", HOLDING_FOLDER_NAME.lower()}
 # Apps own the folders in Android/, and an app can delete its files at any time (cache cleanup or uninstall).
-# So the search for copies in the other folders skips them. A copy in the WhatsApp (or --folder) folders still counts:
-# keep_order puts it last, and print_summary warns when the only copy that stays is in WhatsApp.
+# So the search for copies in the other folders skips them. A copy in the checked folders still counts:
+# keep_order puts it after the copies in other folders, and print_summary warns when the only copy that stays is there.
 APP_FOLDERS = ("Android",)
+# Other apps can read only Android/media. Android/data and Android/obb are private, so the search for WhatsApp folders skips them.
+SHARED_APP_FOLDER = "media"
 # A file in a trash or recycle bin folder can disappear soon. These folders are skipped in every search,
 # so such a file never counts as a copy, and the script never deletes it.
 TRASH_FOLDER_NAME = re.compile(r"trash|recycle", re.IGNORECASE)
@@ -219,27 +219,76 @@ def is_inside(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
 
 
-def in_whatsapp_folder(path: str, storage: str) -> bool:
-    return any(is_inside(path, os.path.join(storage, folder)) for folder in DEFAULT_FOLDERS)
+def in_whatsapp_app_folder(path: str, storage: str) -> bool:
+    """True for a file in the folder that a WhatsApp app uses (Android/media/com.whatsapp...). The chats show this copy."""
+    media = os.path.join(storage, APP_FOLDERS[0], SHARED_APP_FOLDER)
+    if not is_inside(path, media) or folder_key(path) == folder_key(media):
+        return False
+    app = os.path.relpath(folder_key(path), folder_key(media)).split(os.sep)[0]
+    return WHATSAPP_NAME in app
 
 
 def inside_holding_folder(path: str) -> bool:
     return HOLDING_FOLDER_NAME.lower() in (part.lower() for part in os.path.normpath(path).split(os.sep))
 
 
+def find_whatsapp_folders(storage: str) -> List[str]:
+    """The folders with "whatsapp" in their name, anywhere in the phone storage. A folder inside one of them is part of it.
+    Skips the folders that the script never reads: hidden, sticker, trash and GPTK-deleted folders, links and private app folders."""
+    found = []
+    private_parent = folder_key(os.path.join(storage, APP_FOLDERS[0]))
+    for current, dirs, _ in os.walk(storage):
+        walk_into = []
+        for name in sorted(dirs):
+            path = os.path.join(current, name)
+            if (
+                name.startswith(".")
+                or name.lower() in SKIPPED_FOLDER_NAMES
+                or TRASH_FOLDER_NAME.search(name) is not None
+                or os.path.islink(path)
+                or (folder_key(current) == private_parent and name.lower() != SHARED_APP_FOLDER)
+            ):
+                continue
+            if WHATSAPP_NAME in name.casefold():
+                found.append(path)
+            else:
+                walk_into.append(name)
+        dirs[:] = walk_into
+    return found
+
+
+def storage_path(path: str, storage: str) -> str:
+    """The path in the form STORAGE/..., also when it goes through a link to the phone storage (for example /sdcard/...).
+    Then every search and the suggestion see the folder in the same form as the copies in the rest of the storage."""
+    real_storage = os.path.realpath(storage)
+    real_path = os.path.realpath(path)
+    if is_inside(path, storage) or not is_inside(real_path, real_storage):
+        return path
+    return os.path.normpath(os.path.join(storage, os.path.relpath(real_path, real_storage)))
+
+
 def resolve_folders(storage: str, requested: Optional[Sequence[str]]) -> List[str]:
+    if not requested:
+        print('Looking for folders with "WhatsApp" in their name. This can take a minute.')
+        return find_whatsapp_folders(storage)
     folders = []
-    for folder in requested or DEFAULT_FOLDERS:
-        path = os.path.normpath(os.path.join(storage, folder))
+    for folder in requested:
+        path = storage_path(os.path.normpath(os.path.join(storage, folder)), storage)
         if inside_holding_folder(path):
             # The files there were already moved. Reading them again could make them count as copies.
             print(f"Skipped {shown(path)}: the files in {HOLDING_FOLDER_NAME} are never read.")
         elif os.path.isdir(path):
             if path not in folders:
                 folders.append(path)
-        elif requested:
+        else:
             print(f"Folder not found: {shown(path)}")
     return folders
+
+
+def print_folders(folders: Sequence[str]) -> None:
+    print("Reading photos and videos in:")
+    for folder in folders:
+        print("  " + shown(folder))
 
 
 def media_file(path: str, info: os.stat_result, folder: str, elsewhere: bool) -> MediaFile:
@@ -367,7 +416,7 @@ def parse_time(value: object) -> Optional[dt.datetime]:
 
 def print_no_folders(storage: str, requested: Optional[Sequence[str]]) -> None:
     if not requested:
-        print("No WhatsApp media folder found in " + shown(storage) + ".")
+        print('No folder with "WhatsApp" in its name found in ' + shown(storage) + ".")
     print("Make sure that you did these steps:")
     print("  1. Run: termux-setup-storage")
     print('  2. Give Termux the "Files" or "All files access" permission.')
@@ -389,9 +438,7 @@ def command_scan(args: argparse.Namespace) -> int:
         print(f"Download folder not found: {shown(downloads)}")
         return EXIT_INPUT_ERROR
 
-    print("Reading photos and videos in:")
-    for folder in folders:
-        print("  " + shown(folder))
+    print_folders(folders)
     hashed, unreadable, folder_errors = hash_media_files(folders)
     hashes = sorted({hash_value for _, hash_value in hashed})
     content = {
@@ -502,12 +549,14 @@ def build_groups(hashed: Sequence[Tuple[MediaFile, str]], found: Dict[str, str],
     ]
 
 
-def keep_order(media: MediaFile, storage: str) -> Tuple[bool, bool, bool, float, int, str]:
-    """Sort key that puts the best copy to keep first: outside WhatsApp, outside app and Download folders, then the oldest."""
+def keep_order(media: MediaFile, storage: str) -> Tuple[bool, bool, bool, bool, float, int, str]:
+    """Sort key that puts the best copy to keep first: outside the checked folders, then in the folder that WhatsApp uses
+    (so that the chat still shows it), then outside app and Download folders, then the oldest."""
     # A copy in an app folder (Android/...) is deleted together with the app. Download is often emptied.
-    in_app_folder = is_inside(media.path, os.path.join(storage, "Android"))
+    in_app_folder = is_inside(media.path, os.path.join(storage, APP_FOLDERS[0]))
     in_download = is_inside(media.path, os.path.join(storage, "Download"))
-    return (not media.elsewhere, in_app_folder, in_download, media.modified, len(media.path), media.path)
+    in_whatsapp_app = in_whatsapp_app_folder(media.path, storage)
+    return (not media.elsewhere, not in_whatsapp_app, in_app_folder, in_download, media.modified, len(media.path), media.path)
 
 
 def suggested_choice(group: CopyGroup, storage: str) -> Choice:
@@ -633,12 +682,10 @@ def print_summary(deletions: Sequence[Deletion], storage: str, list_files: bool)
             print("  " + shown(item.media.path))
     if any(not item.media.elsewhere for item in deletions):
         print("In WhatsApp chats, the moved photos and videos will show as not available.")
-    only_in_whatsapp = {
-        item.hash for item in deletions if item.media_key is None and item.kept is not None and in_whatsapp_folder(item.kept.path, storage)
-    }
-    if only_in_whatsapp:
-        print(f"Note: {count_text(len(only_in_whatsapp), 'file')} not confirmed in Google Photos will have only 1 copy left, in WhatsApp.")
-        print("If you then delete the chat with its media, or uninstall WhatsApp, that copy is gone for good.")
+    only_in_checked_folders = {item.hash for item in deletions if item.media_key is None and item.kept is not None and not item.kept.elsewhere}
+    if only_in_checked_folders:
+        print(f"Note: {count_text(len(only_in_checked_folders), 'file')} not confirmed in Google Photos will have only 1 copy left, in the folders that this script cleans.")
+        print("If you then delete that copy (for example, you delete the chat with its media, or uninstall WhatsApp), the file is gone for good.")
 
 
 def unchanged_file(path: str, hash_value: str) -> Optional[os.stat_result]:
@@ -930,6 +977,7 @@ def find_and_delete(args: argparse.Namespace, ask: Callable[[str], str], downloa
     if not folders:
         print_no_folders(args.storage, args.folder)
         return EXIT_INPUT_ERROR
+    print_folders(folders)
     hashed, _, folder_errors = hash_media_files(folders)
     print_folder_errors(folder_errors)
     print("Looking for copies in the other folders of the phone. This can take a few minutes.")
@@ -1129,7 +1177,8 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--folder",
         action="append",
-        help="folder to use instead of the WhatsApp folders, relative to the phone storage (you can use it again for more folders)",
+        help="folder to check instead of the WhatsApp folders: a path relative to the phone storage, or a full path "
+        "(you can use it again for more folders)",
     )
     common.add_argument(
         "--storage",

@@ -38,7 +38,7 @@ As simple as selecting "Library" source, clicking `Move to trash`, then clearing
 
 ### Freeing phone space (Phone Check)
 
-Phone Check finds photos and videos on your Android phone (for example, in the WhatsApp folder) that are already in your Google Photos, and extra copies of them in other folders of the phone. Then a small script moves only the files that you choose to a holding folder. From there, you can put them back, or delete them for good.
+Phone Check finds photos and videos in the WhatsApp folders of your Android phone (or in folders that you choose) that are already in your Google Photos, and extra copies of them on the phone. Then a small script moves only the files that you choose to a holding folder. From there, you can put them back, or delete them for good.
 
 Safety and privacy:
 
@@ -54,7 +54,7 @@ You need, on the phone: Firefox with Violentmonkey (or Tampermonkey) and GPTK, a
 
 1. In Termux, run `termux-setup-storage` and allow file access ("All files access" on Android 11 and later).
 2. Run `pkg upgrade`, then `pkg install python curl`. Termux packages must all be upgraded together: if `curl` stops with "CANNOT LINK EXECUTABLE", run `apt update && apt full-upgrade`, then try again. Then download the script: `curl -L -o gptk_phone_check.py https://raw.githubusercontent.com/iCloud17/Google-Photos-Toolkit/main/tools/phone-check/gptk_phone_check.py`
-3. Run `python gptk_phone_check.py scan`. It writes `Download/gptk-fingerprints.json`.
+3. Run `python gptk_phone_check.py scan`. It finds every folder with "WhatsApp" in its name, anywhere in the phone storage (for example `Android/media/com.whatsapp`, the old `WhatsApp` folder, or a copy from an old phone). It shows the list of folders, then writes `Download/gptk-fingerprints.json`. Read the list. If it shows a folder that you do not want to clean, use `--folder` to choose the folders (see Options).
 4. In Firefox, open photos.google.com, open GPTK, then open `Phone Check`. Choose `gptk-fingerprints.json`, tap `Check`, then tap `Download Result`. Always download the result, also when nothing is found, so that it replaces any older result.
 5. In Termux, run `python gptk_phone_check.py clean`. The result file is valid for 2 days, and only for the last scan. If you scan again, check the new `gptk-fingerprints.json` in GPTK again.
 6. The script looks for copies in the other folders of the phone (this can take a few minutes). For each file with more than one copy, type one of these answers:
@@ -63,20 +63,20 @@ You need, on the phone: Firefox with Violentmonkey (or Tampermonkey) and GPTK, a
    - `skip`: keep all copies.
    - `auto`: use the suggestion for this file and all the next files.
    - `stop`: keep all copies of this file and all the next files.
-   - Enter: use the suggestion. It keeps a copy outside WhatsApp if there is one (not in Download if possible, then the oldest). It deletes all copies only if Google Photos has the file and all copies are in WhatsApp.
+   - Enter: use the suggestion. It keeps a copy outside the WhatsApp folders if there is one (not in Download if possible, then the oldest). If all copies are in the WhatsApp folders, it keeps the copy in the folder that WhatsApp uses (`Android/media/com.whatsapp...`), so that WhatsApp can still show it. It deletes all copies only if Google Photos has the file and all copies are in the WhatsApp folders.
 7. Read the summary, then type `yes` to move the files to `Download/GPTK-deleted`. They still use space on the phone.
 8. Check your photos and WhatsApp chats. To put all the files back, run `python gptk_phone_check.py undo`.
 9. When you are sure, run `python gptk_phone_check.py empty` and type `yes`. This deletes the moved files for good and frees the space.
 
 To look only for copies, without Google Photos (no steps 3 and 4), run `python gptk_phone_check.py copies`. Steps 7 to 9 are the same.
 
-Options: `--folder "Pictures/Screenshots"` checks a different folder (relative to the phone storage, can be repeated). Use the same `--folder` options for `scan` and `clean`. `--list` (for `clean` and `copies`) shows each file before you confirm. To try it safely first, use a small test folder.
+Options: `--folder "Pictures/Screenshots"` checks this folder instead of the WhatsApp folders. Give a path relative to the phone storage, or a full path (for example `/storage/emulated/0/Pictures/Screenshots`). You can use `--folder` more than once. Use the same `--folder` options for `scan` and `clean`. `--list` (for `clean` and `copies`) shows each file before you confirm. To try it safely first, use a small test folder.
 
 Limits:
 
 - Only identical copies are found. Edited or re-saved copies are not found, so they stay on the phone.
-- Copies are searched only in the internal storage, not on an SD card. The script skips hidden files and folders and trash and recycle bin folders everywhere (also in the WhatsApp or `--folder` folders). In the other folders, it does not search app folders (`Android/...`), because an app can delete its files at any time.
-- If a file is not confirmed in Google Photos and all its copies are in WhatsApp (for example, the same photo in 2 chats), the suggestion keeps 1 copy in WhatsApp. If you then delete that chat with its media, or uninstall WhatsApp, the file is gone. The summary before `yes` shows how many files this applies to. To keep all copies of a file, type `skip`.
+- Copies are searched only in the internal storage, not on an SD card. The script skips hidden files and folders and trash and recycle bin folders everywhere (also in the WhatsApp or `--folder` folders). In the other folders, it does not search app folders (`Android/...`), because an app can delete its files at any time. The search for WhatsApp folders also skips `WhatsApp Stickers`, `GPTK-deleted`, links to folders, and the private app folders (`Android/data` and `Android/obb`).
+- If a file is not confirmed in Google Photos and all its copies are in the WhatsApp folders (for example, the same photo in 2 chats), the suggestion keeps 1 copy, in the folder that WhatsApp uses if possible. If you then delete that chat with its media, or uninstall WhatsApp, the file is gone. The summary before `yes` shows how many files this applies to. To keep all copies of a file, type `skip`.
 - Files whose Google Photos copy is in Storage saver quality stay on the phone, because that copy is smaller than the original.
 - After you move or delete WhatsApp media, WhatsApp chats show it as not available. The copies stay in Google Photos.
 - If Google Photos already backs up the folder, the Google Photos app's "Free up space" can do a similar cleanup.
